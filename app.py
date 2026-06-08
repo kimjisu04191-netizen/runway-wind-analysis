@@ -147,78 +147,12 @@ ASOS_BY_REGION = {
     ],
 }
 
-# AWS: 방재기상관측소 주요 관측소 (공항·해안·도심 중심, 분자료 API 집계 대상)
-# ※ 공공 API는 분자료(1분)만 제공 → 시간 평균 집계 필요. 호출량 많고 속도 저하 주의.
-AWS_BY_REGION = {
-    "서울": [
-        ("400", "강남"), ("401", "서초"), ("402", "강동"), ("403", "송파"),
-        ("404", "강서"), ("410", "관악"), ("411", "영등포"), ("412", "은평"),
-        ("413", "마포"), ("421", "성북"), ("423", "중랑"), ("424", "동대문"),
-        ("509", "기상청"),
-    ],
-    "인천": [
-        ("549", "공항"), ("551", "강화"), ("552", "영종"), ("553", "인천송도"),
-        ("554", "백령도"), ("627", "인천"),
-    ],
-    "경기": [
-        ("517", "과천"), ("518", "광명"), ("519", "부천"), ("520", "시흥"),
-        ("521", "김포"), ("546", "안양"), ("555", "의왕"), ("556", "군포"),
-        ("557", "안산"), ("571", "수원"), ("572", "평택"), ("573", "화성"),
-        ("574", "용인"), ("591", "성남"), ("592", "하남"), ("593", "구리"),
-    ],
-    "강원": [
-        ("523", "춘천"), ("524", "홍천"), ("525", "강릉"), ("527", "평창"),
-        ("528", "영월"), ("529", "태백"), ("530", "정선"), ("531", "삼척"),
-        ("532", "속초"), ("540", "화천"), ("541", "양구"), ("542", "인제"),
-    ],
-    "충북": [
-        ("533", "청주"), ("534", "충주"), ("535", "제천"), ("558", "음성"),
-        ("559", "진천"),
-    ],
-    "대전": [
-        ("647", "대전"),
-    ],
-    "세종": [
-        ("648", "세종"),
-    ],
-    "충남": [
-        ("536", "천안"), ("537", "아산"), ("538", "서산"), ("539", "당진"),
-        ("655", "공주"), ("656", "논산"), ("657", "부여"), ("658", "금산"),
-    ],
-    "전북": [
-        ("561", "전주"), ("562", "군산"), ("563", "김제"), ("564", "정읍"),
-        ("565", "남원"), ("566", "무주"),
-    ],
-    "광주": [
-        ("672", "광주"),
-    ],
-    "전남": [
-        ("567", "목포"), ("568", "여수"), ("569", "순천"), ("570", "광양"),
-        ("578", "해남"), ("579", "완도"), ("580", "진도"), ("581", "흑산도"),
-        ("692", "무안공항"),
-    ],
-    "대구": [
-        ("143", "대구"), ("860", "대구수성"), ("861", "대구달서"),
-    ],
-    "경북": [
-        ("743", "포항"), ("744", "경주"), ("745", "안동"), ("746", "구미"),
-        ("748", "영주"), ("756", "울릉"), ("788", "포항공항"),
-    ],
-    "부산": [
-        ("900", "부산"), ("904", "부산북항"), ("910", "기장"),
-    ],
-    "울산": [
-        ("152", "울산"), ("932", "울산북구"),
-    ],
-    "경남": [
-        ("788", "사천공항"), ("904", "김해공항"), ("931", "진주"),
-        ("932", "창원"), ("933", "통영"), ("934", "거제"),
-    ],
-    "제주": [
-        ("184", "제주"), ("185", "고산"), ("188", "성산"), ("189", "서귀포"),
-        ("781", "제주공항"), ("782", "성산공항"),
-    ],
-}
+# ※ AWS(방재기상관측) 관측소 목록은 의도적으로 제공하지 않음.
+#   - 기상청 API 허브의 공식 관측소 정보 API(stn_inf.php?inf=AWS)는 "활용신청 필요(403)"로 비공개
+#   - 검증되지 않은 추정 ID/명칭을 보여주면 사용자에게 혼동을 줄 수 있어 제외함
+#   - 더 근본적으로, AWS 시간자료 API(awsh.php)는 "단일 시점 조회"만 지원하고
+#     기간(tm1~tm2) 조회는 항상 "최근 약 1개월"만 반환하도록 고정되어 있어
+#     5~10년 분석에 필요한 장기 시계열 수집이 구조적으로 불가능함 (아래 사이드바 안내 참고)
 
 # 플랫 조회용 (id → (type, name, region, start_date))
 def _build_lookup():
@@ -226,12 +160,6 @@ def _build_lookup():
     for region, lst in ASOS_BY_REGION.items():
         for sid, name, start in lst:
             lk.setdefault(sid, ("ASOS", name, region, start))
-    for region, lst in AWS_BY_REGION.items():
-        for tup in lst:
-            sid, name = tup[0], tup[1]
-            # ASOS와 ID 충돌 시 ASOS 우선
-            if sid not in lk:
-                lk[sid] = ("AWS", name, region, "2000-01-01")
     return lk
 
 STATION_LOOKUP = _build_lookup()
@@ -458,41 +386,54 @@ api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password")
 st.sidebar.markdown("#### 2. 관측소 선택")
 obs_type = st.sidebar.radio(
     "관측종류",
-    ["ASOS (종관)", "AWS (방재·실험적)"],
+    ["ASOS (종관)", "AWS (방재) — 현재 미지원"],
     horizontal=True,
-    help="ASOS는 시간자료 직접 제공. AWS는 분자료를 시간 평균으로 집계 (호출량 많고 느림).",
+    help=(
+        "ASOS: 기간(시작∼종료) 범위 조회 API 제공 → 5∼10년 장기분석 가능.\n"
+        "AWS: 단일 시점 조회만 지원되어 장기분석 불가 (자세한 사유는 선택 시 안내)."
+    ),
 )
 is_asos = obs_type.startswith("ASOS")
-region_db = ASOS_BY_REGION if is_asos else AWS_BY_REGION
-region_list = list(region_db.keys())
-default_region_idx = region_list.index("전남") if "전남" in region_list else 0
-region = st.sidebar.selectbox("광역시도", region_list, index=default_region_idx)
 
-# 해당 광역시도의 관측소 목록
-stations_in_region = region_db[region]
 if is_asos:
+    region_db = ASOS_BY_REGION
+    region_list = list(region_db.keys())
+    default_region_idx = region_list.index("전남") if "전남" in region_list else 0
+    region = st.sidebar.selectbox("광역시도", region_list, index=default_region_idx)
+
+    # 해당 광역시도의 관측소 목록
+    stations_in_region = region_db[region]
     stn_labels = [f"{name} ({sid}) · {start}" for sid, name, start in stations_in_region]
     default_name = "목포" if region == "전남" else stations_in_region[0][1]
     default_idx = next((i for i, s in enumerate(stations_in_region) if s[1] == default_name), 0)
-else:
-    stn_labels = [f"{name} ({sid})" for sid, name in stations_in_region]
-    default_idx = 0
 
-selected_idx = st.sidebar.selectbox("관측소", range(len(stn_labels)),
-                                    format_func=lambda i: stn_labels[i],
-                                    index=default_idx)
-sel = stations_in_region[selected_idx]
-stn_id = sel[0]
-stn_name = sel[1]
-stn_start = sel[2] if is_asos else "—"
-
-if is_asos:
+    selected_idx = st.sidebar.selectbox("관측소", range(len(stn_labels)),
+                                        format_func=lambda i: stn_labels[i],
+                                        index=default_idx)
+    sel = stations_in_region[selected_idx]
+    stn_id = sel[0]
+    stn_name = sel[1]
+    stn_start = sel[2]
     st.sidebar.success(f"📌 [ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
 else:
+    # AWS는 분석을 지원하지 않음 — 정확한 사유를 안내하고 ASOS 사용을 권장
+    region = "—"
+    stn_id = None
+    stn_name = "(AWS 미지원)"
+    stn_start = "2000-01-01"  # 하단 기간선택 로직이 깨지지 않도록 두는 더미 값
     st.sidebar.warning(
-        f"⚠️ [AWS] {stn_name} ({region}) — 분자료 집계 방식. "
-        f"현재 앱은 ASOS 시간자료 API 전용이므로, AWS 분석은 추후 업데이트 예정입니다. "
-        f"가장 가까운 ASOS 관측소를 사용해 주세요."
+        "🚧 **AWS(방재) 관측소는 현재 분석을 지원하지 않습니다**\n\n"
+        "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검한 결과:\n\n"
+        "- **단일 시점(예: `tm=2024010115`) 조회만 지원**되고, "
+        "기간(`tm1`∼`tm2`) 조회 파라미터는 과거 날짜를 넣어도 무시되어 "
+        "**항상 '최근 약 1개월' 자료만** 돌아옵니다.\n"
+        "- 따라서 5∼10년치 시계열을 모으려면 **시간 단위로 약 4만∼9만 회**의 "
+        "API 호출이 필요해, 인터랙티브 웹앱에서 안정적으로 처리하기 어렵습니다.\n"
+        "- 공식 관측소 목록 API(`stn_inf.php`)도 별도 활용신청이 필요해 "
+        "검증된 관측소 명단을 제공할 수 없는 상태입니다.\n\n"
+        "✅ **ASOS(종관) 관측소**는 기간 범위 조회를 지원해 5∼10년 분석에 적합합니다. "
+        "위에서 **ASOS (종관)** 으로 전환 후 인접 관측소를 선택해 주세요.\n\n"
+        "_(AWS 지원 방안은 추후 별도로 검토할 예정입니다.)_"
     )
 
 st.sidebar.markdown("---")
@@ -574,10 +515,16 @@ if st.sidebar.button("🚀 분석 시작"):
         st.error("API Key를 입력하세요.")
     elif not is_asos:
         st.error(
-            f"❌ AWS(방재) 관측소 **{stn_name}** 는 현재 분석 대상이 아닙니다.\n\n"
-            f"공공데이터포털 KMA API에서 AWS는 **분(分)자료만** 제공하므로, "
-            f"시간 단위 분석을 위해서는 60배 호출량과 풍향 벡터 평균 집계 로직이 필요합니다.\n\n"
-            f"해결 방법: 사이드바에서 **ASOS (종관)** 로 전환 후 **{region}** 지역의 인접 관측소를 선택하세요."
+            "❌ **AWS(방재) 관측소 분석은 현재 지원되지 않습니다**\n\n"
+            "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검해본 결과, "
+            "이 API는 **단일 시점 조회만 지원**하고 기간(`tm1`∼`tm2`) 범위 조회는 "
+            "과거 날짜를 입력해도 무시한 채 항상 '최근 약 1개월' 자료만 돌려줍니다.\n\n"
+            "즉 5∼10년치 시계열을 모으려면 **시간당 1회씩 약 4만∼9만 회**의 API 호출이 필요해, "
+            "이 앱이 요구하는 장기 가동률 분석(ICAO 95% 기준)에는 구조적으로 적합하지 않습니다.\n\n"
+            "✅ **해결 방법**: 사이드바 관측종류를 **ASOS (종관)** 으로 전환 후, "
+            "인접 지역의 관측소를 선택해 분석을 진행해 주세요. "
+            "ASOS는 기간 범위 조회 API를 제공하여 5∼10년 분석에 적합합니다.\n\n"
+            "_(AWS 지원 방안은 추후 별도 검토 예정입니다.)_"
         )
     else:
         df, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
