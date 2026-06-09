@@ -1,3 +1,4 @@
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -266,6 +267,70 @@ def get_weather_data_v28(key, stn, s_date, e_date):
         df = df.drop_duplicates(subset=['tm'])
     return df, len(df)
 
+# --- [AWS CSV 파싱 함수] ---
+def _parse_aws_csv(uploaded_files):
+    """기상자료개방포털 방재기상관측 시간자료 CSV 파싱.
+    - 인코딩 자동 감지 (UTF-8-sig / EUC-KR / CP949)
+    - 복수 파일 병합 지원 (연도별 분할 다운로드 대응)
+    - 풍향·풍속 컬럼 자동 탐지
+    반환: (df, row_count, (start_date, end_date)) 또는 (None, error_msg, (None, None))
+    """
+    all_dfs = []
+    for f in uploaded_files:
+        raw = f.read()
+        text = None
+        for enc in ('utf-8-sig', 'euc-kr', 'cp949', 'utf-8'):
+            try:
+                text = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        if text is None:
+            return None, f"'{f.name}' 인코딩 인식 불가 (UTF-8 또는 EUC-KR 파일 필요).", (None, None)
+        try:
+            tmp = pd.read_csv(io.StringIO(text))
+            all_dfs.append(tmp)
+        except Exception as e:
+            return None, f"'{f.name}' CSV 파싱 오류: {e}", (None, None)
+
+    if not all_dfs:
+        return None, "업로드된 파일이 없습니다.", (None, None)
+
+    df = pd.concat(all_dfs, ignore_index=True)
+
+    # ── 풍향 컬럼 탐지 ────────────────────────────────────────────
+    wd_col = next((c for c in df.columns if '풍향' in c), None)
+    # 풍속: '최대', '순간', '돌풍' 제외한 첫 번째 풍속 컬럼
+    ws_col = next(
+        (c for c in df.columns
+         if '풍속' in c and all(kw not in c for kw in ['최대', '순간', '돌풍'])),
+        None
+    )
+
+    if wd_col is None:
+        return None, f"풍향 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
+    if ws_col is None:
+        return None, f"풍속 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
+
+    df['wd']    = pd.to_numeric(df[wd_col], errors='coerce')
+    df['ws_kt'] = pd.to_numeric(df[ws_col], errors='coerce') * 1.94384   # m/s → knots
+
+    # ── 날짜 범위 자동 감지 ───────────────────────────────────────
+    dt_col = next((c for c in df.columns if '일시' in c or '날짜' in c), None)
+    csv_start = csv_end = None
+    if dt_col is not None:
+        parsed_dt = pd.to_datetime(df[dt_col], errors='coerce').dropna()
+        if len(parsed_dt) > 0:
+            csv_start = parsed_dt.min().date()
+            csv_end   = parsed_dt.max().date()
+
+    df = df.dropna(subset=['wd', 'ws_kt'])
+    if len(df) == 0:
+        return None, "풍향·풍속 유효 데이터가 없습니다 (모두 결측).", (csv_start, csv_end)
+
+    return df, len(df), (csv_start, csv_end)
+
+
 # --- [ICAO/논문 기반 분석 함수] ---
 # 논문: 신동진, 김도현 (2009) "활주로 방향설정을 위한 풍배도 프로그램의 개발 연구"
 # 기준: ICAO Annex 14 / Doc. 9157 Airport Design Manual Part 1
@@ -395,6 +460,8 @@ obs_type = st.sidebar.radio(
 )
 is_asos = obs_type.startswith("ASOS")
 
+aws_files = []   # ASOS 경로에서도 변수가 항상 정의되도록
+
 if is_asos:
     region_db = ASOS_BY_REGION
     region_list = list(region_db.keys())
@@ -416,25 +483,34 @@ if is_asos:
     stn_start = sel[2]
     st.sidebar.success(f"[ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
 else:
-    # AWS는 분석을 지원하지 않음 — 정확한 사유를 안내하고 ASOS 사용을 권장
+    # AWS: API 대신 기상자료개방포털 CSV 업로드 방식
     region = "—"
     stn_id = None
-    stn_name = "(AWS 미지원)"
-    stn_start = "2000-01-01"  # 하단 기간선택 로직이 깨지지 않도록 두는 더미 값
-    st.sidebar.warning(
-        "**AWS(방재) 관측소는 현재 분석을 지원하지 않습니다**\n\n"
-        "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검한 결과:\n\n"
-        "- **단일 시점(예: `tm=2024010115`) 조회만 지원**되고, "
-        "기간(`tm1`∼`tm2`) 조회 파라미터는 과거 날짜를 넣어도 무시되어 "
-        "**항상 '최근 약 1개월' 자료만** 돌아옵니다.\n"
-        "- 따라서 5∼10년치 시계열을 모으려면 **시간 단위로 약 4만∼9만 회**의 "
-        "API 호출이 필요해, 인터랙티브 웹앱에서 안정적으로 처리하기 어렵습니다.\n"
-        "- 공식 관측소 목록 API(`stn_inf.php`)도 별도 활용신청이 필요해 "
-        "검증된 관측소 명단을 제공할 수 없는 상태입니다.\n\n"
-        "**ASOS(종관) 관측소**는 기간 범위 조회를 지원해 5∼10년 분석에 적합합니다. "
-        "위에서 **ASOS (종관)** 으로 전환 후 인접 관측소를 선택해 주세요.\n\n"
-        "_(AWS 지원 방안은 추후 별도로 검토할 예정입니다.)_"
+    stn_start = "2000-01-01"   # 기간선택 위젯이 깨지지 않도록 두는 더미 값
+
+    st.sidebar.info(
+        "**방재기상관측(AWS) — CSV 업로드 방식**\n\n"
+        "기상청 API는 단일 시점 조회만 지원하여 장기 분석이 불가합니다.  \n"
+        "[기상자료개방포털](https://data.kma.go.kr)에서 CSV를 직접 다운로드 후 "
+        "아래에 업로드하면 동일한 분석이 가능합니다."
     )
+    with st.sidebar.expander("CSV 다운로드 방법"):
+        st.markdown(
+            "1. [기상자료개방포털](https://data.kma.go.kr) 접속  \n"
+            "2. **기후통계분석 → 방재기상관측 → 시간자료**  \n"
+            "3. 관측소·기간 선택 후 **CSV 다운로드**  \n"
+            "4. 연도별로 나눠 받은 경우 여러 파일을 동시에 업로드 가능  \n"
+            "5. 컬럼에 **풍향(deg)** 과 **풍속(m/s)** 이 포함된 파일이어야 합니다."
+        )
+    stn_name = st.sidebar.text_input("관측소 이름 (차트 표시용)", value="AWS 관측소")
+    aws_files = st.sidebar.file_uploader(
+        "AWS 시간자료 CSV (복수 파일 동시 업로드 가능)",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="aws_csv",
+    )
+    if aws_files:
+        st.sidebar.success(f"{len(aws_files)}개 파일 업로드됨")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("#### 분석 기간")
@@ -511,30 +587,40 @@ if st.sidebar.button("데이터 캐시 삭제"):
 
 # 3. 분석 실행
 if st.sidebar.button("분석 시작"):
-    if not api_key:
-        st.error("API Key를 입력하세요.")
-    elif not is_asos:
-        st.error(
-            "**AWS(방재) 관측소 분석은 현재 지원되지 않습니다**\n\n"
-            "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검해본 결과, "
-            "이 API는 **단일 시점 조회만 지원**하고 기간(`tm1`∼`tm2`) 범위 조회는 "
-            "과거 날짜를 입력해도 무시한 채 항상 '최근 약 1개월' 자료만 돌려줍니다.\n\n"
-            "즉 5∼10년치 시계열을 모으려면 **시간당 1회씩 약 4만∼9만 회**의 API 호출이 필요해, "
-            "이 앱이 요구하는 장기 가동률 분석(ICAO 95% 기준)에는 구조적으로 적합하지 않습니다.\n\n"
-            "**해결 방법**: 사이드바 관측종류를 **ASOS (종관)** 으로 전환 후, "
-            "인접 지역의 관측소를 선택해 분석을 진행해 주세요. "
-            "ASOS는 기간 범위 조회 API를 제공하여 5∼10년 분석에 적합합니다.\n\n"
-            "_(AWS 지원 방안은 추후 별도 검토 예정입니다.)_"
-        )
-    else:
-        df, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
+    df = None
+    row_count = None
+    _chart_start = start_date
+    _chart_end   = end_date
 
-        if df is None:
-            st.error(f"분석 실패: {result}")
+    # ── 데이터 수집 ─────────────────────────────────────────────
+    if is_asos:
+        if not api_key:
+            st.error("API Key를 입력하세요.")
         else:
-            st.success(f"{stn_name} · {result:,}시간 데이터 수집 완료")
-            with st.spinner("바람성분 vector 분석 중..."):
-                A = analyze_runway(df)
+            df, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
+            if df is None:
+                st.error(f"분석 실패: {result}")
+            else:
+                row_count = result
+    else:
+        # AWS CSV 업로드 경로
+        if not aws_files:
+            st.error("사이드바에서 AWS 시간자료 CSV 파일을 업로드하세요.")
+        else:
+            df, result, (csv_s, csv_e) = _parse_aws_csv(aws_files)
+            if df is None:
+                st.error(f"CSV 파싱 실패: {result}")
+            else:
+                row_count = result
+                if csv_s and csv_e:
+                    _chart_start, _chart_end = csv_s, csv_e
+
+    # ── 분석 & 표시 (ASOS / AWS 공통) ───────────────────────────
+    if df is not None:
+
+        st.success(f"{stn_name} · {row_count:,}시간 데이터 수집 완료")
+        with st.spinner("바람성분 vector 분석 중..."):
+            A = analyze_runway(df)
 
             # --- 데이터 요약 ---
             st.divider()
@@ -652,7 +738,7 @@ if st.sidebar.button("분석 시작"):
                     color="speed_bin",
                     color_discrete_map=_color_map,
                     category_orders={"speed_bin": _spd_labels},
-                    title=f"Wind Rose — {stn_name}  ({start_date:%Y-%m} ~ {end_date:%Y-%m})",
+                    title=f"Wind Rose — {stn_name}  ({_chart_start:%Y-%m} ~ {_chart_end:%Y-%m})",
                     template="plotly_white",
                 )
                 fig2.update_layout(
@@ -751,6 +837,6 @@ if st.sidebar.button("분석 시작"):
                 st.download_button(
                     "CSV 다운로드",
                     csv_bytes,
-                    file_name=f"runway_usability_{stn_name}_{start_date}_{end_date}_step{step}.csv",
+                    file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step{step}.csv",
                     mime="text/csv",
                 )
