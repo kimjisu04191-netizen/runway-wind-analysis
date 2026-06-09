@@ -11,8 +11,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # 1. 페이지 설정
-st.set_page_config(page_title="활주로 분석기 V2.8 (병렬 수집)", layout="wide")
-st.title("✈️ 활주로 이용률 정밀 분석 (병렬 수집으로 속도 개선)")
+st.set_page_config(page_title="활주로 이용률 정밀 분석", layout="wide")
+st.title("활주로 이용률 정밀 분석")
 
 # --- [내장 데이터] 광역시도 → (ASOS 종관 / AWS 방재) 관측소 계층 ---
 # ASOS: 기상청 종관기상관측망 전체 (94개소) — AsosHourlyInfoService API로 시간자료 제공
@@ -252,7 +252,7 @@ def get_weather_data_v28(key, stn, s_date, e_date):
             p_bar.progress(done / total)
             msg_slot.info(f"⏳ 수집 진행 {done}/{total}개월 · 경과 {time.perf_counter()-t0:.1f}s")
 
-    msg_slot.success(f"✅ 수집 완료 · {len(all_combined):,}행 · 총 {time.perf_counter()-t0:.1f}s")
+    msg_slot.success(f"수집 완료 · {len(all_combined):,}행 · 총 {time.perf_counter()-t0:.1f}s")
 
     if not all_combined:
         return None, "수집된 데이터가 없습니다. 날짜와 지점을 확인하세요."
@@ -380,7 +380,7 @@ def _build_freq_table(wd, ws, N_total):
     return df_out
 
 # 2. 사이드바 UI
-st.sidebar.header("📋 분석 설정")
+st.sidebar.header("분석 설정")
 api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password")
 
 st.sidebar.markdown("#### 2. 관측소 선택")
@@ -414,7 +414,7 @@ if is_asos:
     stn_id = sel[0]
     stn_name = sel[1]
     stn_start = sel[2]
-    st.sidebar.success(f"📌 [ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
+    st.sidebar.success(f"[ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
 else:
     # AWS는 분석을 지원하지 않음 — 정확한 사유를 안내하고 ASOS 사용을 권장
     region = "—"
@@ -422,7 +422,7 @@ else:
     stn_name = "(AWS 미지원)"
     stn_start = "2000-01-01"  # 하단 기간선택 로직이 깨지지 않도록 두는 더미 값
     st.sidebar.warning(
-        "🚧 **AWS(방재) 관측소는 현재 분석을 지원하지 않습니다**\n\n"
+        "**AWS(방재) 관측소는 현재 분석을 지원하지 않습니다**\n\n"
         "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검한 결과:\n\n"
         "- **단일 시점(예: `tm=2024010115`) 조회만 지원**되고, "
         "기간(`tm1`∼`tm2`) 조회 파라미터는 과거 날짜를 넣어도 무시되어 "
@@ -431,7 +431,7 @@ else:
         "API 호출이 필요해, 인터랙티브 웹앱에서 안정적으로 처리하기 어렵습니다.\n"
         "- 공식 관측소 목록 API(`stn_inf.php`)도 별도 활용신청이 필요해 "
         "검증된 관측소 명단을 제공할 수 없는 상태입니다.\n\n"
-        "✅ **ASOS(종관) 관측소**는 기간 범위 조회를 지원해 5∼10년 분석에 적합합니다. "
+        "**ASOS(종관) 관측소**는 기간 범위 조회를 지원해 5∼10년 분석에 적합합니다. "
         "위에서 **ASOS (종관)** 으로 전환 후 인접 관측소를 선택해 주세요.\n\n"
         "_(AWS 지원 방안은 추후 별도로 검토할 예정입니다.)_"
     )
@@ -486,18 +486,18 @@ end_date = date(end_y, end_m, _last_day)
 # 유효성 및 요약
 _months = (end_y - start_y) * 12 + (end_m - start_m) + 1
 if start_date > end_date:
-    st.sidebar.error("⚠️ 시작이 종료보다 늦습니다.")
+    st.sidebar.error("시작이 종료보다 늦습니다.")
 elif _months < 60:
-    st.sidebar.warning(f"⚠️ {_months}개월 (<5년) — ICAO 권고 기간 미달")
-    st.sidebar.caption(f"📅 {start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월")
+    st.sidebar.warning(f"{_months}개월 (<5년) — ICAO 권고 기간 미달")
+    st.sidebar.caption(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월")
 else:
-    st.sidebar.success(f"📅 {start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월 ({_months/12:.1f}년)")
+    st.sidebar.success(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월 ({_months/12:.1f}년)")
 
 st.sidebar.markdown("#### 3. 측풍 허용치 (ICAO Doc. 9157)")
 rwy_length = st.sidebar.number_input("활주로 길이 (m)", min_value=300, max_value=5000, value=2000, step=100)
 low_friction = st.sidebar.checkbox("종방향 마찰계수 부족 (활주로 제동효과 불량)", value=False)
 auto_limit, auto_note = select_limit_by_rwy_length(rwy_length, low_friction)
-st.sidebar.info(f"🎯 자동 선택: **{auto_limit} kt** · {auto_note}")
+st.sidebar.info(f"자동 선택: **{auto_limit} kt** · {auto_note}")
 override = st.sidebar.checkbox("수동 선택 사용", value=False)
 if override:
     primary_limit = st.sidebar.selectbox("측풍 허용치 (Knot)", CROSSWIND_LIMITS_KT,
@@ -505,23 +505,23 @@ if override:
 else:
     primary_limit = auto_limit
 
-if st.sidebar.button("🧹 데이터 캐시 삭제"):
+if st.sidebar.button("데이터 캐시 삭제"):
     st.cache_data.clear()
     st.sidebar.info("캐시가 삭제되었습니다.")
 
 # 3. 분석 실행
-if st.sidebar.button("🚀 분석 시작"):
+if st.sidebar.button("분석 시작"):
     if not api_key:
         st.error("API Key를 입력하세요.")
     elif not is_asos:
         st.error(
-            "❌ **AWS(방재) 관측소 분석은 현재 지원되지 않습니다**\n\n"
+            "**AWS(방재) 관측소 분석은 현재 지원되지 않습니다**\n\n"
             "기상청 API 허브의 방재기상관측 시간자료 API(`awsh.php`)를 직접 점검해본 결과, "
             "이 API는 **단일 시점 조회만 지원**하고 기간(`tm1`∼`tm2`) 범위 조회는 "
             "과거 날짜를 입력해도 무시한 채 항상 '최근 약 1개월' 자료만 돌려줍니다.\n\n"
             "즉 5∼10년치 시계열을 모으려면 **시간당 1회씩 약 4만∼9만 회**의 API 호출이 필요해, "
             "이 앱이 요구하는 장기 가동률 분석(ICAO 95% 기준)에는 구조적으로 적합하지 않습니다.\n\n"
-            "✅ **해결 방법**: 사이드바 관측종류를 **ASOS (종관)** 으로 전환 후, "
+            "**해결 방법**: 사이드바 관측종류를 **ASOS (종관)** 으로 전환 후, "
             "인접 지역의 관측소를 선택해 분석을 진행해 주세요. "
             "ASOS는 기간 범위 조회 API를 제공하여 5∼10년 분석에 적합합니다.\n\n"
             "_(AWS 지원 방안은 추후 별도 검토 예정입니다.)_"
@@ -530,10 +530,10 @@ if st.sidebar.button("🚀 분석 시작"):
         df, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
 
         if df is None:
-            st.error(f"❌ 분석 실패: {result}")
+            st.error(f"분석 실패: {result}")
         else:
-            st.success(f"✅ {stn_name} · {result:,}시간 데이터 수집 완료")
-            with st.spinner("📊 바람성분 vector 분석 중..."):
+            st.success(f"{stn_name} · {result:,}시간 데이터 수집 완료")
+            with st.spinner("바람성분 vector 분석 중..."):
                 A = analyze_runway(df)
 
             # --- 데이터 요약 ---
@@ -546,28 +546,28 @@ if st.sidebar.button("🚀 분석 시작"):
             st.caption("※ Calm(무영향) 데이터는 논문 §3.2에 따라 활주로 방향 무관하게 '이용 가능'으로 집계됩니다.")
 
             # --- 주 결과(자동/수동 선택된 한계치) ---
-            st.subheader(f"🎯 분석 결과 · 허용치 {primary_limit} kt")
+            st.subheader(f"분석 결과 · 허용치 {primary_limit} kt")
             r = A['results'][primary_limit]
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("최적 활주로", rwy_name(r['best_angle']), f"{r['best_angle']}°")
             c2.metric("최대 이용률", f"{r['best_usab']:.3f}%",
-                      "✅ PASS" if r['pass'] else "❌ FAIL")
+                      "PASS" if r['pass'] else "FAIL")
             c3.metric("평균 측풍", f"{r['mean_xwind']:.2f} kt")
             c4.metric("동율 후보", f"{r['tied_count']}개",
                       "동율 처리 적용" if r['tied_count'] > 1 else "유일")
 
             if not r['pass']:
                 st.warning(
-                    f"⚠️ 단일 활주로로 95% 미달. 2개 활주로 최적 조합: "
+                    f"단일 활주로로 95% 미달. 2개 활주로 최적 조합: "
                     f"**{rwy_name(r['pair_angles'][0])} + {rwy_name(r['pair_angles'][1])}** "
                     f"→ 이용률 **{r['pair_usab']:.3f}%** "
-                    f"{'✅ PASS' if r['pair_pass'] else '❌ 여전히 FAIL'}"
+                    f"{'PASS' if r['pair_pass'] else '여전히 FAIL'}"
                 )
 
             # --- 탭 ---
             t1, t2, t3, t4, t5, t6 = st.tabs([
-                "📊 3개 허용치 종합", "📈 이용률 곡선", "🌀 바람장미",
-                "📋 16방위 빈도표", "🛬 2개 활주로 분석", "📐 방위각 상세표"
+                "3개 허용치 종합", "이용률 곡선", "바람장미",
+                "16방위 빈도표", "2개 활주로 분석", "방위각 상세표"
             ])
 
             with t1:
@@ -583,7 +583,7 @@ if st.sidebar.button("🚀 분석 시작"):
                         "평균 측풍 (kt)": round(rr['mean_xwind'], 2),
                         "최대 측풍 (kt)": round(rr['max_xwind'], 2),
                         "동율 후보수": rr['tied_count'],
-                        "단일 판정": "✅ PASS" if rr['pass'] else "❌ FAIL",
+                        "단일 판정": "PASS" if rr['pass'] else "FAIL",
                         "2개 조합 이용률 (%)": round(rr['pair_usab'], 3),
                         "2개 조합": f"{rwy_name(rr['pair_angles'][0])} + {rwy_name(rr['pair_angles'][1])}",
                     })
@@ -691,7 +691,7 @@ if st.sidebar.button("🚀 분석 시작"):
                 d1.metric("1차 활주로", rwy_name(p1), f"{p1}°")
                 d2.metric("2차 활주로", rwy_name(p2), f"{p2}°")
                 d3.metric("조합 이용률", f"{r['pair_usab']:.3f}%",
-                          "✅ PASS" if r['pair_pass'] else "❌ FAIL")
+                          "PASS" if r['pair_pass'] else "FAIL")
                 st.info(
                     f"단일 활주로 최대 이용률: **{r['best_usab']:.3f}%** → "
                     f"2개 조합 이용률: **{r['pair_usab']:.3f}%** "
@@ -732,7 +732,7 @@ if st.sidebar.button("🚀 분석 시작"):
                 st.dataframe(styled, width='stretch', hide_index=True)
 
                 # 최적 방향 요약
-                st.markdown("##### 📌 허용치별 최적 방위각 (표 기준)")
+                st.markdown("##### 허용치별 최적 방위각 (표 기준)")
                 best_rows = []
                 for lim in CROSSWIND_LIMITS_KT:
                     sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", f"{lim} kt 이용률 (%)"]]
@@ -742,14 +742,14 @@ if st.sidebar.button("🚀 분석 시작"):
                         "최적 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
                         "활주로": top['활주로'],
                         "이용률 (%)": f"{top[f'{lim} kt 이용률 (%)']:.2f}",
-                        "판정": "✅ PASS" if top[f'{lim} kt 이용률 (%)'] >= USABILITY_TARGET else "❌ FAIL",
+                        "판정": "PASS" if top[f'{lim} kt 이용률 (%)'] >= USABILITY_TARGET else "FAIL",
                     })
                 st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
 
                 # CSV 다운로드
                 csv_bytes = df_table.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
                 st.download_button(
-                    "💾 CSV 다운로드",
+                    "CSV 다운로드",
                     csv_bytes,
                     file_name=f"runway_usability_{stn_name}_{start_date}_{end_date}_step{step}.csv",
                     mime="text/csv",
