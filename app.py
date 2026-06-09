@@ -229,7 +229,7 @@ def get_weather_data_v28(key, stn, s_date, e_date):
     chunks = _month_chunks(s_date, e_date)
     total = len(chunks)
     if total == 0:
-        return None, "날짜 범위가 비어 있습니다."
+        return None, None, "날짜 범위가 비어 있습니다."
 
     msg_slot = st.empty()
     p_bar = st.progress(0)
@@ -256,16 +256,19 @@ def get_weather_data_v28(key, stn, s_date, e_date):
     msg_slot.success(f"수집 완료 · {len(all_combined):,}행 · 총 {time.perf_counter()-t0:.1f}s")
 
     if not all_combined:
-        return None, "수집된 데이터가 없습니다. 날짜와 지점을 확인하세요."
+        return None, None, "수집된 데이터가 없습니다. 날짜와 지점을 확인하세요."
 
     df = pd.DataFrame(all_combined)
-    df['wd'] = pd.to_numeric(df['wd'], errors='coerce')
+    df['wd']    = pd.to_numeric(df['wd'], errors='coerce')
     df['ws_kt'] = pd.to_numeric(df['ws'], errors='coerce') * 1.94384
-    df = df.dropna(subset=['wd', 'ws_kt'])
     # 관측 시각 기준 중복 제거(병렬 중복 방어)
     if 'tm' in df.columns:
         df = df.drop_duplicates(subset=['tm'])
-    return df, len(df)
+    # ── 유효 / 결측 분리 ──────────────────────────────────────────
+    invalid_mask = df['wd'].isna() | df['ws_kt'].isna()
+    df_invalid   = df[invalid_mask].reset_index(drop=True)
+    df_valid     = df[~invalid_mask].reset_index(drop=True)
+    return df_valid, df_invalid, len(df_valid)
 
 # --- [AWS CSV 파싱 함수] ---
 def _parse_aws_csv(uploaded_files):
@@ -273,7 +276,8 @@ def _parse_aws_csv(uploaded_files):
     - 인코딩 자동 감지 (UTF-8-sig / EUC-KR / CP949)
     - 복수 파일 병합 지원 (연도별 분할 다운로드 대응)
     - 풍향·풍속 컬럼 자동 탐지
-    반환: (df, row_count, (start_date, end_date)) 또는 (None, error_msg, (None, None))
+    반환: (df_valid, df_invalid, row_count, (start_date, end_date))
+          또는 (None, None, error_msg, (None, None))
     """
     all_dfs = []
     for f in uploaded_files:
@@ -286,15 +290,15 @@ def _parse_aws_csv(uploaded_files):
             except (UnicodeDecodeError, LookupError):
                 continue
         if text is None:
-            return None, f"'{f.name}' 인코딩 인식 불가 (UTF-8 또는 EUC-KR 파일 필요).", (None, None)
+            return None, None, f"'{f.name}' 인코딩 인식 불가 (UTF-8 또는 EUC-KR 파일 필요).", (None, None)
         try:
             tmp = pd.read_csv(io.StringIO(text))
             all_dfs.append(tmp)
         except Exception as e:
-            return None, f"'{f.name}' CSV 파싱 오류: {e}", (None, None)
+            return None, None, f"'{f.name}' CSV 파싱 오류: {e}", (None, None)
 
     if not all_dfs:
-        return None, "업로드된 파일이 없습니다.", (None, None)
+        return None, None, "업로드된 파일이 없습니다.", (None, None)
 
     df = pd.concat(all_dfs, ignore_index=True)
 
@@ -308,9 +312,9 @@ def _parse_aws_csv(uploaded_files):
     )
 
     if wd_col is None:
-        return None, f"풍향 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
+        return None, None, f"풍향 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
     if ws_col is None:
-        return None, f"풍속 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
+        return None, None, f"풍속 컬럼을 찾을 수 없습니다. 전체 컬럼: {list(df.columns)}", (None, None)
 
     df['wd']    = pd.to_numeric(df[wd_col], errors='coerce')
     df['ws_kt'] = pd.to_numeric(df[ws_col], errors='coerce') * 1.94384   # m/s → knots
@@ -324,11 +328,15 @@ def _parse_aws_csv(uploaded_files):
             csv_start = parsed_dt.min().date()
             csv_end   = parsed_dt.max().date()
 
-    df = df.dropna(subset=['wd', 'ws_kt'])
-    if len(df) == 0:
-        return None, "풍향·풍속 유효 데이터가 없습니다 (모두 결측).", (csv_start, csv_end)
+    # ── 유효 / 결측 분리 ──────────────────────────────────────────
+    invalid_mask  = df['wd'].isna() | df['ws_kt'].isna()
+    df_invalid    = df[invalid_mask].reset_index(drop=True)
+    df_valid      = df[~invalid_mask].reset_index(drop=True)
 
-    return df, len(df), (csv_start, csv_end)
+    if len(df_valid) == 0:
+        return None, None, "풍향·풍속 유효 데이터가 없습니다 (모두 결측).", (csv_start, csv_end)
+
+    return df_valid, df_invalid, len(df_valid), (csv_start, csv_end)
 
 
 # --- [ICAO/논문 기반 분석 함수] ---
@@ -597,7 +605,7 @@ if st.sidebar.button("분석 시작"):
         if not api_key:
             st.error("API Key를 입력하세요.")
         else:
-            df, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
+            df, df_invalid_rows, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
             if df is None:
                 st.error(f"분석 실패: {result}")
             else:
@@ -607,7 +615,7 @@ if st.sidebar.button("분석 시작"):
         if not aws_files:
             st.error("사이드바에서 AWS 시간자료 CSV 파일을 업로드하세요.")
         else:
-            df, result, (csv_s, csv_e) = _parse_aws_csv(aws_files)
+            df, df_invalid_rows, result, (csv_s, csv_e) = _parse_aws_csv(aws_files)
             if df is None:
                 st.error(f"CSV 파싱 실패: {result}")
             else:
@@ -849,3 +857,49 @@ if st.sidebar.button("분석 시작"):
                     file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step{step}.csv",
                     mime="text/csv",
                 )
+
+            # ── 데이터 품질 검토 ───────────────────────────────────────
+            st.divider()
+            st.subheader("데이터 품질 검토")
+
+            _n_valid   = A['N_total']
+            _n_invalid = len(df_invalid_rows) if df_invalid_rows is not None else 0
+            _n_raw     = _n_valid + _n_invalid
+            _valid_pct = _n_valid   / _n_raw * 100 if _n_raw > 0 else 0
+            _miss_pct  = _n_invalid / _n_raw * 100 if _n_raw > 0 else 0
+
+            qa1, qa2, qa3 = st.columns(3)
+            qa1.metric("전체 수집 행",          f"{_n_raw:,} 행")
+            qa2.metric("유효 데이터 (풍향+풍속 존재)", f"{_n_valid:,} 행",   f"{_valid_pct:.1f}%")
+            qa3.metric("결측 데이터 (풍향 또는 풍속 없음)", f"{_n_invalid:,} 행", f"{_miss_pct:.1f}%")
+
+            st.caption(
+                "**유효**: 풍향(°)과 풍속(m/s) 값이 모두 관측된 시각 → 분석에 사용됨  \n"
+                "**결측**: 풍향 또는 풍속이 누락된 시각 (장비 오류·통신 두절 등) → 분석에서 제외됨"
+            )
+
+            # Excel 2-시트 다운로드 (유효 / 결측)
+            _excel_buf = io.BytesIO()
+            # 유효 데이터: 주요 컬럼만 선별해 가독성 확보
+            _valid_export_cols = [c for c in ['tm', 'wd', 'ws', 'ws_kt'] if c in df.columns]
+            _valid_export = df[_valid_export_cols].copy() if _valid_export_cols else df.copy()
+            _rename_map = {'tm': '관측시각', 'wd': '풍향(°)', 'ws': '풍속(m/s)', 'ws_kt': '풍속(kt)'}
+            _valid_export.rename(columns=_rename_map, inplace=True)
+
+            with pd.ExcelWriter(_excel_buf, engine='openpyxl') as _writer:
+                _valid_export.to_excel(_writer, sheet_name='유효_데이터', index=False)
+                if _n_invalid > 0:
+                    _inv_export = df_invalid_rows.copy()
+                    _inv_export.rename(columns=_rename_map, inplace=True)
+                    _inv_export.to_excel(_writer, sheet_name='결측_데이터', index=False)
+                else:
+                    pd.DataFrame({"안내": ["결측 데이터가 없습니다."]}).to_excel(
+                        _writer, sheet_name='결측_데이터', index=False
+                    )
+
+            st.download_button(
+                "데이터 품질 보고서 다운로드 (Excel)",
+                _excel_buf.getvalue(),
+                file_name=f"data_quality_{stn_name}_{_chart_start}_{_chart_end}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
