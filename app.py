@@ -618,13 +618,22 @@ if st.sidebar.button("분석 시작"):
     # ── 분석 & 표시 (ASOS / AWS 공통) ───────────────────────────
     if df is not None:
 
-        st.success(f"{stn_name} · {row_count:,}시간 데이터 수집 완료")
+        _period_months = (
+            (_chart_end.year - _chart_start.year) * 12
+            + (_chart_end.month - _chart_start.month) + 1
+        )
+        st.success(
+            f"{stn_name} · {row_count:,}시간 수집 완료 "
+            f"· 실제 분석 기간: **{_chart_start:%Y-%m-%d} ~ {_chart_end:%Y-%m-%d}** "
+            f"({_period_months}개월)"
+        )
         with st.spinner("바람성분 vector 분석 중..."):
             A = analyze_runway(df)
 
             # --- 데이터 요약 ---
             st.divider()
-            s1, s2, s3, s4 = st.columns(4)
+            s0, s1, s2, s3, s4 = st.columns(5)
+            s0.metric("분석 기간", f"{_chart_start:%Y-%m}", f"~ {_chart_end:%Y-%m}")
             s1.metric("전체 관측 시간", f"{A['N_total']:,} h")
             s2.metric("Calm (0~3 kt)", f"{A['N_calm']:,} h", f"{A['calm_pct']:.2f}%")
             s3.metric("유효 데이터", f"{A['N_eff']:,} h")
