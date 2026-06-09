@@ -606,9 +606,74 @@ if st.sidebar.button("🚀 분석 시작"):
                 st.plotly_chart(fig1, width='stretch')
 
             with t3:
-                fig2 = px.bar_polar(df, r="ws_kt", theta="wd", color="ws_kt",
-                                    title="Wind Rose (풍향/풍속 분포)",
-                                    color_continuous_scale=px.colors.sequential.Plasma)
+                # ── 바람장미 집계: 16방위 × 6풍속구간 → 빈도(%) ──────────
+                _wd_r  = df['wd'].to_numpy(dtype=np.float32)
+                _ws_r  = df['ws_kt'].to_numpy(dtype=np.float32)
+                _N_r   = len(_wd_r)
+
+                # 16방위 bin (22.5° 간격, N=0°)
+                _dir_ang  = np.arange(0, 360, 22.5)                    # [0, 22.5 … 337.5]
+                _dir_idx  = ((((_wd_r + 11.25) // 22.5) % 16)).astype(np.int32)
+
+                # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21
+                _spd_labels = ["0–3 kt", "3–7 kt", "7–11 kt",
+                               "11–17 kt", "17–21 kt", "≥21 kt"]
+                _spd_thresh = [3, 7, 11, 17, 21]                        # 오름차순 경계값
+                _spd_idx = np.zeros(_N_r, dtype=np.int32)
+                for _i, _t in enumerate(_spd_thresh):
+                    _spd_idx[_ws_r > _t] = _i + 1                      # 초과(>) 기준 bin 배정
+
+                # 집계 (16 × 6) → 전체 관측 대비 %
+                _rose_rows = []
+                for _d in range(16):
+                    for _s in range(6):
+                        _cnt = int(((_dir_idx == _d) & (_spd_idx == _s)).sum())
+                        _rose_rows.append({
+                            'angle':     float(_dir_ang[_d]),
+                            'speed_bin': _spd_labels[_s],
+                            'freq_pct':  _cnt / _N_r * 100.0,
+                        })
+                _df_rose = pd.DataFrame(_rose_rows)
+
+                # 이산 색상 (오름차순: 연한색 → 진한색)
+                _color_map = {
+                    "0–3 kt":   "#c6dbef",   # 연한 하늘색 (calm)
+                    "3–7 kt":   "#74c476",   # 연두
+                    "7–11 kt":  "#fdd835",   # 노랑
+                    "11–17 kt": "#fd8d3c",   # 주황
+                    "17–21 kt": "#e31a1c",   # 빨강
+                    "≥21 kt":   "#67000d",   # 암적색 (강풍)
+                }
+
+                fig2 = px.bar_polar(
+                    _df_rose,
+                    r="freq_pct",
+                    theta="angle",
+                    color="speed_bin",
+                    color_discrete_map=_color_map,
+                    category_orders={"speed_bin": _spd_labels},
+                    title=f"Wind Rose — {stn_name}  ({start_date:%Y-%m} ~ {end_date:%Y-%m})",
+                    template="plotly_white",
+                )
+                fig2.update_layout(
+                    polar=dict(
+                        angularaxis=dict(
+                            tickmode="array",
+                            tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                            ticktext=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+                            direction="clockwise",
+                            rotation=90,           # N을 12시 방향으로
+                        ),
+                        radialaxis=dict(
+                            ticksuffix="%",        # 반경 축 단위 (%)
+                            angle=45,              # 눈금 레이블 겹침 방지
+                            tickangle=45,
+                        ),
+                    ),
+                    legend=dict(title="풍속 구간", traceorder="normal"),
+                    margin=dict(t=60, b=30, l=30, r=30),
+                    height=540,
+                )
                 st.plotly_chart(fig2, width='stretch')
 
             with t4:
