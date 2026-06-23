@@ -10,6 +10,7 @@ from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from pyproj import Transformer
 
 # 1. 페이지 설정
 st.set_page_config(page_title="활주로 이용률 정밀 분석", layout="wide")
@@ -339,6 +340,127 @@ def _parse_aws_csv(uploaded_files):
     return df_valid, df_invalid, len(df_valid), (csv_start, csv_end)
 
 
+# --- [주소 기반 관측소 검색 함수] ---
+# 1) 기상청 API 허브 stn_inf.php  → ASOS/AWS 관측소 위경도 DB
+# 2) juso.go.kr 주소검색 API     → 입력 주소 → 행정코드(admCd/rnMgtSn 등)
+# 3) juso.go.kr 좌표제공 API     → 행정코드 → TM좌표(entX/entY, EPSG:5179)
+# 4) pyproj                      → EPSG:5179 → WGS84(위경도) 변환
+# 5) Haversine                   → 관측소 DB와의 거리 계산 → 최근접 N개
+
+_TM_TO_WGS84 = Transformer.from_crs("EPSG:5179", "EPSG:4326", always_xy=True)
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _load_station_db(auth_key):
+    """기상청 API 허브 stn_inf.php로 ASOS(SFC)+AWS 관측소 위경도 DB 구축.
+    고정폭 텍스트(EUC-KR) → 바이트 단위 슬라이싱으로 파싱 (한글 폭 깨짐 방지)."""
+    base = "https://apihub.kma.go.kr/api/typ01/url/stn_inf.php"
+    tm = datetime.now().strftime('%Y%m%d%H%M')
+
+    def _fetch_lines(inf):
+        r = requests.get(base, params={'inf': inf, 'stn': '', 'tm': tm, 'help': '0', 'authKey': auth_key}, timeout=15)
+        lines = r.content.split(b'\n')
+        return [l for l in lines if l.strip() and not l.startswith(b'#')]
+
+    rows = []
+    # SFC(종관/ASOS): STN_ID(0:5) LON(5:19) LAT(19:33) ... STN_KO(96:117) ... LAW_ADDR(163:222)
+    for line in _fetch_lines('SFC'):
+        rows.append({
+            'stn_id': line[0:5].decode('euc-kr', errors='replace').strip(),
+            'lon':    line[5:19].decode('euc-kr', errors='replace').strip(),
+            'lat':    line[19:33].decode('euc-kr', errors='replace').strip(),
+            'name_ko': line[96:117].decode('euc-kr', errors='replace').strip(),
+            'addr':   line[163:222].decode('euc-kr', errors='replace').strip(),
+            'type':   'ASOS',
+        })
+    # AWS(방재): STN_ID(0:5) LON(5:19) LAT(19:33) ... STN_KO(71:92) ... LAW_ADDR(138:197)
+    for line in _fetch_lines('AWS'):
+        rows.append({
+            'stn_id': line[0:5].decode('euc-kr', errors='replace').strip(),
+            'lon':    line[5:19].decode('euc-kr', errors='replace').strip(),
+            'lat':    line[19:33].decode('euc-kr', errors='replace').strip(),
+            'name_ko': line[71:92].decode('euc-kr', errors='replace').strip(),
+            'addr':   line[138:197].decode('euc-kr', errors='replace').strip(),
+            'type':   'AWS',
+        })
+
+    df = pd.DataFrame(rows)
+    df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
+    df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
+    df = df.dropna(subset=['lon', 'lat']).reset_index(drop=True)
+    return df
+
+
+def _geocode_address(keyword, confm_key):
+    """도로명주소 검색 API: 주소 키워드 → 행정코드 필드 1건. 반환: (juso_item, error_msg)."""
+    try:
+        r = requests.post(
+            "https://www.juso.go.kr/addrlink/addrLinkApi.do",
+            data={'confmKey': confm_key, 'currentPage': '1', 'countPerPage': '1',
+                  'keyword': keyword, 'resultType': 'json'},
+            timeout=10,
+        )
+        data = r.json()
+        common = data.get('results', {}).get('common', {})
+        if common.get('errorCode') != '0':
+            return None, common.get('errorMessage', '알 수 없는 오류')
+        juso_list = data.get('results', {}).get('juso') or []
+        if not juso_list:
+            return None, "검색된 주소가 없습니다. 더 구체적인 도로명주소를 입력해 보세요."
+        return juso_list[0], None
+    except Exception as e:
+        return None, str(e)
+
+
+def _get_wgs84_coords(juso_item, confm_key):
+    """좌표제공 API: 행정코드 → TM좌표(EPSG:5179) → WGS84 위경도. 반환: (lat, lon, error_msg)."""
+    try:
+        r = requests.post(
+            "https://www.juso.go.kr/addrlink/addrCoordApi.do",
+            data={
+                'confmKey': confm_key,
+                'admCd': juso_item.get('admCd', ''),
+                'rnMgtSn': juso_item.get('rnMgtSn', ''),
+                'udrtYn': juso_item.get('udrtYn', '0'),
+                'buldMnnm': juso_item.get('buldMnnm', '0'),
+                'buldSlno': juso_item.get('buldSlno', '0'),
+                'resultType': 'json',
+            },
+            timeout=10,
+        )
+        data = r.json()
+        common = data.get('results', {}).get('common', {})
+        if common.get('errorCode') != '0':
+            return None, None, (
+                f"{common.get('errorMessage', '좌표제공 API 오류')} "
+                "(좌표제공 API는 주소검색 API와 별도로 business.juso.go.kr에서 활용신청이 필요합니다)"
+            )
+        coord_list = data.get('results', {}).get('juso') or []
+        if not coord_list:
+            return None, None, "좌표 결과가 없습니다."
+        ent_x = float(coord_list[0]['entX'])
+        ent_y = float(coord_list[0]['entY'])
+        lon, lat = _TM_TO_WGS84.transform(ent_x, ent_y)
+        return lat, lon, None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """두 위경도 좌표 간 대원거리(km)."""
+    R = 6371.0
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi, dlambda = np.radians(lat2 - lat1), np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlambda / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+
+def _nearest_stations(lat, lon, station_df, stn_type, n=3):
+    """station_df에서 stn_type('ASOS'/'AWS') 관측소 중 (lat,lon)에 가장 가까운 n개."""
+    sub = station_df[station_df['type'] == stn_type].copy()
+    sub['dist_km'] = _haversine_km(lat, lon, sub['lat'].to_numpy(), sub['lon'].to_numpy())
+    return sub.sort_values('dist_km').head(n).reset_index(drop=True)
+
+
 # --- [ICAO/논문 기반 분석 함수] ---
 # 논문: 신동진, 김도현 (2009) "활주로 방향설정을 위한 풍배도 프로그램의 개발 연구"
 # 기준: ICAO Annex 14 / Doc. 9157 Airport Design Manual Part 1
@@ -455,6 +577,74 @@ def _build_freq_table(wd, ws, N_total):
 # 2. 사이드바 UI
 st.sidebar.header("분석 설정")
 api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password")
+
+with st.sidebar.expander("주소로 가까운 관측소 검색"):
+    st.caption(
+        "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다.  \n"
+        "**서로 다른 두 기관의 API 키**가 필요합니다."
+    )
+    kma_hub_key = st.text_input(
+        "기상청 API 허브 인증키",
+        type="password", key="kma_hub_key",
+        help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회용, AWS 시간자료 키와 동일 계열)",
+    )
+    juso_key = st.text_input(
+        "도로명주소 API 키 (confmKey)",
+        type="password", key="juso_key",
+        help="business.juso.go.kr에서 발급받은 승인키. 좌표제공 API는 별도 활용신청 필요.",
+    )
+    addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
+
+    if st.button("가까운 관측소 검색", key="btn_addr_search"):
+        if not kma_hub_key or not juso_key:
+            st.error("기상청 API 허브 인증키와 도로명주소 API 키를 모두 입력하세요.")
+        elif not addr_input:
+            st.error("주소를 입력하세요.")
+        else:
+            with st.spinner("주소 검색 중..."):
+                juso_item, err = _geocode_address(addr_input, juso_key)
+            if err:
+                st.error(f"주소 검색 실패: {err}")
+            else:
+                with st.spinner("좌표 변환 중..."):
+                    lat, lon, err2 = _get_wgs84_coords(juso_item, juso_key)
+                if err2:
+                    st.error(f"좌표 변환 실패: {err2}")
+                else:
+                    st.success(
+                        f"검색 위치: {juso_item.get('roadAddr', addr_input)}  "
+                        f"({lat:.5f}, {lon:.5f})"
+                    )
+                    with st.spinner("관측소 DB 로딩 중..."):
+                        try:
+                            stn_db = _load_station_db(kma_hub_key)
+                        except Exception as e:
+                            stn_db = None
+                            st.error(f"관측소 DB 로딩 실패: {e}")
+
+                    if stn_db is not None and len(stn_db) > 0:
+                        near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
+                        near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
+
+                        _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
+                                      'dist_km': '거리(km)', 'addr': '주소'}
+
+                        st.markdown("**종관(ASOS) 최근접 3개소**")
+                        st.dataframe(
+                            near_asos[list(_disp_cols)].rename(columns=_disp_cols)
+                                .style.format({'거리(km)': '{:.2f}'}),
+                            hide_index=True, width='stretch',
+                        )
+                        st.markdown("**방재(AWS) 최근접 3개소**")
+                        st.dataframe(
+                            near_aws[list(_disp_cols)].rename(columns=_disp_cols)
+                                .style.format({'거리(km)': '{:.2f}'}),
+                            hide_index=True, width='stretch',
+                        )
+                        st.caption(
+                            "ASOS는 아래 '관측소 선택'에서 해당 지점을 고르세요. "
+                            "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
+                        )
 
 st.sidebar.markdown("#### 2. 관측소 선택")
 obs_type = st.sidebar.radio(
