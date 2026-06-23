@@ -4,4 +4,3 @@ numpy==2.4.4
 requests==2.33.1
 plotly==6.7.0
 openpyxl==3.1.5
-pyproj==3.7.1
