@@ -539,9 +539,18 @@ def _build_freq_table(wd, ws, N_total):
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
     return df_out
 
+# --- [개인용 기본값] secrets.toml에 저장된 키를 입력란 기본값으로 자동 채움.
+#     secrets.toml은 .gitignore 처리되어 GitHub(public repo)에는 절대 올라가지 않음.
+def _secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
 # 2. 사이드바 UI
 st.sidebar.header("분석 설정")
-api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password")
+api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password",
+                                 value=_secret("ASOS_API_KEY"))
 
 with st.sidebar.expander("주소로 가까운 관측소 검색"):
     st.caption(
@@ -550,12 +559,12 @@ with st.sidebar.expander("주소로 가까운 관측소 검색"):
     )
     kma_hub_key = st.text_input(
         "기상청 API 허브 인증키",
-        type="password", key="kma_hub_key",
+        type="password", key="kma_hub_key", value=_secret("KMA_HUB_KEY"),
         help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회용, AWS 시간자료 키와 동일 계열)",
     )
     kakao_key = st.text_input(
         "카카오 REST API 키",
-        type="password", key="kakao_key",
+        type="password", key="kakao_key", value=_secret("KAKAO_REST_KEY"),
         help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
              "별도 승인 대기 없이 바로 사용 가능합니다.",
     )
