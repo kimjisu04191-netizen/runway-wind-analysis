@@ -586,14 +586,17 @@ def _build_freq_table(wd, ws, N_total):
     """16방위 × 5개 풍속구간 빈도표(%). 논문 Table 6 한국어 단위(노트) 버전."""
     dir_names = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    speed_bins = [(0, 3), (4, 10), (11, 13), (14, 20), (21, 9999)]
     speed_labels = ["Calm 0–3 kt", "4–10 kt", "11–13 kt", "14–20 kt", ">20 kt"]
+    speed_thresh = [3, 10, 13, 20]                    # 오름차순 경계값(초과 기준, 빈틈 없음)
+    spd_idx = np.zeros(len(ws), dtype=np.int32)
+    for i, t in enumerate(speed_thresh):
+        spd_idx[ws > t] = i + 1                       # (0,3]→0, (3,10]→1, … (20,∞)→4
     # 22.5° 간격, 첫 섹터 N은 348.75°~11.25° 중심
     dir_idx = (((wd + 11.25) // 22.5) % 16).astype(np.int32)
-    table = np.zeros((16, len(speed_bins)), dtype=np.float64)
+    table = np.zeros((16, len(speed_labels)), dtype=np.float64)
     for d in range(16):
-        for s, (lo, hi) in enumerate(speed_bins):
-            table[d, s] = ((dir_idx == d) & (ws >= lo) & (ws <= hi)).sum()
+        for s in range(len(speed_labels)):
+            table[d, s] = ((dir_idx == d) & (spd_idx == s)).sum()
     pct = table / N_total * 100.0
     df_out = pd.DataFrame(pct, index=dir_names, columns=speed_labels).round(2)
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
