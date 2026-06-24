@@ -553,13 +553,40 @@ def _build_freq_table(wd, ws, N_total):
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
     return df_out
 
-# --- [개인용 기본값] secrets.toml에 저장된 키를 입력란 기본값으로 자동 채움.
+# --- [개인용 기본값] secrets.toml에 저장된 키를 세션 상태 기본값으로 자동 채움.
 #     secrets.toml은 .gitignore 처리되어 GitHub(public repo)에는 절대 올라가지 않음.
 def _secret(name, default=""):
     try:
         return st.secrets.get(name, default)
     except Exception:
         return default
+
+# API 키는 메인 화면에 직접 노출하지 않고 세션 상태로만 보관 → 팝업(dialog)에서 입력/수정
+for _sk, _sname in [("api_key", "ASOS_API_KEY"), ("kma_hub_key", "KMA_HUB_KEY"), ("kakao_key", "KAKAO_REST_KEY")]:
+    if _sk not in st.session_state:
+        st.session_state[_sk] = _secret(_sname)
+
+@st.dialog("API 키 설정")
+def _api_key_dialog():
+    st.text_input(
+        "ASOS API Key (Decoding)", type="password", key="api_key",
+        value=st.session_state.get("api_key", ""),
+        help="공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키",
+    )
+    st.text_input(
+        "기상청 API 허브 인증키", type="password", key="kma_hub_key",
+        value=st.session_state.get("kma_hub_key", ""),
+        help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회 및 주소검색용)",
+    )
+    st.text_input(
+        "카카오 REST API 키", type="password", key="kakao_key",
+        value=st.session_state.get("kakao_key", ""),
+        help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
+             "별도 승인 대기 없이 바로 사용 가능합니다.",
+    )
+    st.caption("입력한 값은 이 브라우저 세션에만 유지되며, 코드나 GitHub에는 저장되지 않습니다.")
+    if st.button("닫기", type="primary", use_container_width=True):
+        st.rerun()
 
 # 2. 메인페이지 설정 UI — 사이드바 대신 첫 화면에서 한 번에 설정 (박스 단위로 구획)
 st.markdown("### 분석 설정")
@@ -635,66 +662,58 @@ with row1_col1:
             if aws_files:
                 st.caption(f"{len(aws_files)}개 파일 업로드됨")
 
-        with st.expander("주소로 가까운 관측소 검색"):
-            st.caption(
-                "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다.  \n"
-                "**서로 다른 두 기관의 API 키**가 필요합니다."
-            )
-            kma_hub_key = st.text_input(
-                "기상청 API 허브 인증키",
-                type="password", key="kma_hub_key", value=_secret("KMA_HUB_KEY"),
-                help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회용, AWS 시간자료 키와 동일 계열)",
-            )
-            kakao_key = st.text_input(
-                "카카오 REST API 키",
-                type="password", key="kakao_key", value=_secret("KAKAO_REST_KEY"),
-                help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
-                     "별도 승인 대기 없이 바로 사용 가능합니다.",
-            )
-            addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
+        st.markdown("---")
+        st.markdown("**주소로 가까운 관측소 검색**")
+        st.caption(
+            "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다. "
+            "(기상청 API 허브 인증키·카카오 REST API 키는 상단 'API 키 설정'에서 입력)"
+        )
+        addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
 
-            if st.button("가까운 관측소 검색", key="btn_addr_search"):
-                if not kma_hub_key or not kakao_key:
-                    st.error("기상청 API 허브 인증키와 카카오 REST API 키를 모두 입력하세요.")
-                elif not addr_input:
-                    st.error("주소를 입력하세요.")
+        if st.button("가까운 관측소 검색", key="btn_addr_search"):
+            _kma_hub_key = st.session_state.get("kma_hub_key", "")
+            _kakao_key = st.session_state.get("kakao_key", "")
+            if not _kma_hub_key or not _kakao_key:
+                st.error("'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요.")
+            elif not addr_input:
+                st.error("주소를 입력하세요.")
+            else:
+                with st.spinner("주소 검색 중..."):
+                    lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
+                if err:
+                    st.error(f"주소 검색 실패: {err}")
                 else:
-                    with st.spinner("주소 검색 중..."):
-                        lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, kakao_key)
-                    if err:
-                        st.error(f"주소 검색 실패: {err}")
-                    else:
-                        st.success(f"검색 위치: {disp_addr}  ({lat:.5f}, {lon:.5f})")
-                        with st.spinner("관측소 DB 로딩 중..."):
-                            try:
-                                stn_db = _load_station_db(kma_hub_key)
-                            except Exception as e:
-                                stn_db = None
-                                st.error(f"관측소 DB 로딩 실패: {e}")
+                    st.success(f"검색 위치: {disp_addr}  ({lat:.5f}, {lon:.5f})")
+                    with st.spinner("관측소 DB 로딩 중..."):
+                        try:
+                            stn_db = _load_station_db(_kma_hub_key)
+                        except Exception as e:
+                            stn_db = None
+                            st.error(f"관측소 DB 로딩 실패: {e}")
 
-                        if stn_db is not None and len(stn_db) > 0:
-                            near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
-                            near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
+                    if stn_db is not None and len(stn_db) > 0:
+                        near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
+                        near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
 
-                            _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
-                                          'dist_km': '거리(km)', 'addr': '주소'}
+                        _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
+                                      'dist_km': '거리(km)', 'addr': '주소'}
 
-                            st.markdown("**종관(ASOS) 최근접 3개소**")
-                            st.dataframe(
-                                near_asos[list(_disp_cols)].rename(columns=_disp_cols)
-                                    .style.format({'거리(km)': '{:.2f}'}),
-                                hide_index=True, width='stretch',
-                            )
-                            st.markdown("**방재(AWS) 최근접 3개소**")
-                            st.dataframe(
-                                near_aws[list(_disp_cols)].rename(columns=_disp_cols)
-                                    .style.format({'거리(km)': '{:.2f}'}),
-                                hide_index=True, width='stretch',
-                            )
-                            st.caption(
-                                "ASOS는 위 '관측소 선택'에서 해당 지점을 고르세요. "
-                                "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
-                            )
+                        st.markdown("**종관(ASOS) 최근접 3개소**")
+                        st.dataframe(
+                            near_asos[list(_disp_cols)].rename(columns=_disp_cols)
+                                .style.format({'거리(km)': '{:.2f}'}),
+                            hide_index=True, width='stretch',
+                        )
+                        st.markdown("**방재(AWS) 최근접 3개소**")
+                        st.dataframe(
+                            near_aws[list(_disp_cols)].rename(columns=_disp_cols)
+                                .style.format({'거리(km)': '{:.2f}'}),
+                            hide_index=True, width='stretch',
+                        )
+                        st.caption(
+                            "ASOS는 위 '관측소 선택'에서 해당 지점을 고르세요. "
+                            "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
+                        )
 
 with row1_col2:
     with st.container(border=True):
@@ -759,9 +778,20 @@ row2_col1, row2_col2 = st.columns(2)
 with row2_col1:
     with st.container(border=True):
         st.markdown("**3. API 키**")
-        api_key = st.text_input("ASOS API Key (Decoding)", type="password",
-                                 value=_secret("ASOS_API_KEY"))
-        st.caption("공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키")
+        api_key = st.session_state.get("api_key", "")
+        kma_hub_key = st.session_state.get("kma_hub_key", "")
+        kakao_key = st.session_state.get("kakao_key", "")
+
+        _key_rows = [
+            ("ASOS API Key", api_key),
+            ("기상청 API 허브 인증키", kma_hub_key),
+            ("카카오 REST API 키", kakao_key),
+        ]
+        for _label, _val in _key_rows:
+            st.caption(f"{'✓' if _val else '○'} {_label} · {'설정됨' if _val else '미설정'}")
+
+        if st.button("API 키 설정", use_container_width=True):
+            _api_key_dialog()
 
 with row2_col2:
     with st.container(border=True):
