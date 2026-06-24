@@ -13,7 +13,6 @@ from urllib3.util.retry import Retry
 
 # 1. 페이지 설정
 st.set_page_config(page_title="활주로 이용률 정밀 분석", layout="wide")
-st.title("활주로 이용률 정밀 분석")
 
 # 설정 항목이 많아 한눈에 보기 쉽도록 전체 폰트를 약간 축소
 st.markdown("""
@@ -28,6 +27,53 @@ label[data-testid="stWidgetLabel"] p { font-size: 0.85rem; }
 div[data-testid="stExpander"] summary p { font-size: 0.88rem; }
 </style>
 """, unsafe_allow_html=True)
+
+# --- [개인용 기본값] secrets.toml에 저장된 키를 세션 상태 기본값으로 자동 채움.
+#     secrets.toml은 .gitignore 처리되어 GitHub(public repo)에는 절대 올라가지 않음.
+def _secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+# API 키는 메인 화면에 직접 노출하지 않고 세션 상태로만 보관 → 팝업(dialog)에서 입력/수정
+for _sk, _sname in [("api_key", "ASOS_API_KEY"), ("kma_hub_key", "KMA_HUB_KEY"), ("kakao_key", "KAKAO_REST_KEY")]:
+    if _sk not in st.session_state:
+        st.session_state[_sk] = _secret(_sname)
+
+@st.dialog("API 키 설정")
+def _api_key_dialog():
+    st.text_input(
+        "ASOS API Key (Decoding)", type="password", key="api_key",
+        value=st.session_state.get("api_key", ""),
+        help="공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키",
+    )
+    st.text_input(
+        "기상청 API 허브 인증키", type="password", key="kma_hub_key",
+        value=st.session_state.get("kma_hub_key", ""),
+        help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회 및 주소검색용)",
+    )
+    st.text_input(
+        "카카오 REST API 키", type="password", key="kakao_key",
+        value=st.session_state.get("kakao_key", ""),
+        help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
+             "별도 승인 대기 없이 바로 사용 가능합니다.",
+    )
+    st.caption("입력한 값은 이 브라우저 세션에만 유지되며, 코드나 GitHub에는 저장되지 않습니다.")
+    if st.button("닫기", type="primary", use_container_width=True):
+        st.rerun()
+
+# 제목 + API 키 설정 버튼 (같은 행에 배치)
+title_col1, title_col2 = st.columns([6, 1])
+with title_col1:
+    st.title("활주로 이용률 정밀 분석")
+with title_col2:
+    st.write("")
+    st.write("")
+    if st.button("API 키 설정", use_container_width=True):
+        _api_key_dialog()
+
+api_key = st.session_state.get("api_key", "")
 
 # --- [내장 데이터] 광역시도 → (ASOS 종관 / AWS 방재) 관측소 계층 ---
 # ASOS: 기상청 종관기상관측망 전체 (94개소) — AsosHourlyInfoService API로 시간자료 제공
@@ -553,41 +599,6 @@ def _build_freq_table(wd, ws, N_total):
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
     return df_out
 
-# --- [개인용 기본값] secrets.toml에 저장된 키를 세션 상태 기본값으로 자동 채움.
-#     secrets.toml은 .gitignore 처리되어 GitHub(public repo)에는 절대 올라가지 않음.
-def _secret(name, default=""):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-# API 키는 메인 화면에 직접 노출하지 않고 세션 상태로만 보관 → 팝업(dialog)에서 입력/수정
-for _sk, _sname in [("api_key", "ASOS_API_KEY"), ("kma_hub_key", "KMA_HUB_KEY"), ("kakao_key", "KAKAO_REST_KEY")]:
-    if _sk not in st.session_state:
-        st.session_state[_sk] = _secret(_sname)
-
-@st.dialog("API 키 설정")
-def _api_key_dialog():
-    st.text_input(
-        "ASOS API Key (Decoding)", type="password", key="api_key",
-        value=st.session_state.get("api_key", ""),
-        help="공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키",
-    )
-    st.text_input(
-        "기상청 API 허브 인증키", type="password", key="kma_hub_key",
-        value=st.session_state.get("kma_hub_key", ""),
-        help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회 및 주소검색용)",
-    )
-    st.text_input(
-        "카카오 REST API 키", type="password", key="kakao_key",
-        value=st.session_state.get("kakao_key", ""),
-        help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
-             "별도 승인 대기 없이 바로 사용 가능합니다.",
-    )
-    st.caption("입력한 값은 이 브라우저 세션에만 유지되며, 코드나 GitHub에는 저장되지 않습니다.")
-    if st.button("닫기", type="primary", use_container_width=True):
-        st.rerun()
-
 # 2. 메인페이지 설정 UI — 사이드바 대신 첫 화면에서 한 번에 설정 (박스 단위로 구획)
 st.markdown("### 분석 설정")
 
@@ -773,29 +784,8 @@ with row1_col2:
         else:
             st.success(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월 ({_months/12:.1f}년)")
 
-row2_col1, row2_col2 = st.columns(2)
-
-with row2_col1:
     with st.container(border=True):
-        st.markdown("**3. API 키**")
-        api_key = st.session_state.get("api_key", "")
-        kma_hub_key = st.session_state.get("kma_hub_key", "")
-        kakao_key = st.session_state.get("kakao_key", "")
-
-        _key_rows = [
-            ("ASOS API Key", api_key),
-            ("기상청 API 허브 인증키", kma_hub_key),
-            ("카카오 REST API 키", kakao_key),
-        ]
-        for _label, _val in _key_rows:
-            st.caption(f"{'✓' if _val else '○'} {_label} · {'설정됨' if _val else '미설정'}")
-
-        if st.button("API 키 설정", use_container_width=True):
-            _api_key_dialog()
-
-with row2_col2:
-    with st.container(border=True):
-        st.markdown("**4. 측풍 허용치 (ICAO Doc. 9157)**")
+        st.markdown("**3. 측풍 허용치 (ICAO Doc. 9157)**")
         rwy_length = st.number_input("활주로 길이 (m)", min_value=300, max_value=5000, value=2000, step=100)
         low_friction = st.checkbox("종방향 마찰계수 부족 (활주로 제동효과 불량)", value=False)
         auto_limit, auto_note = select_limit_by_rwy_length(rwy_length, low_friction)
