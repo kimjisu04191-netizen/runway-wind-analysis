@@ -15,6 +15,20 @@ from urllib3.util.retry import Retry
 st.set_page_config(page_title="활주로 이용률 정밀 분석", layout="wide")
 st.title("활주로 이용률 정밀 분석")
 
+# 설정 항목이 많아 한눈에 보기 쉽도록 전체 폰트를 약간 축소
+st.markdown("""
+<style>
+.block-container { padding-top: 2rem; font-size: 0.92rem; }
+h3 { font-size: 1.05rem !important; }
+h4 { font-size: 0.95rem !important; }
+div[data-testid="stMetricValue"] { font-size: 1.2rem; }
+div[data-testid="stMetricLabel"] { font-size: 0.8rem; }
+div[data-testid="stMetricDelta"] { font-size: 0.78rem; }
+label[data-testid="stWidgetLabel"] p { font-size: 0.85rem; }
+div[data-testid="stExpander"] summary p { font-size: 0.88rem; }
+</style>
+""", unsafe_allow_html=True)
+
 # --- [내장 데이터] 광역시도 → (ASOS 종관 / AWS 방재) 관측소 계층 ---
 # ASOS: 기상청 종관기상관측망 전체 (94개소) — AsosHourlyInfoService API로 시간자료 제공
 ASOS_BY_REGION = {
@@ -547,211 +561,234 @@ def _secret(name, default=""):
     except Exception:
         return default
 
-# 2. 사이드바 UI
-st.sidebar.header("분석 설정")
-api_key = st.sidebar.text_input("1. API Key (Decoding)", type="password",
-                                 value=_secret("ASOS_API_KEY"))
+# 2. 메인페이지 설정 UI — 사이드바 대신 첫 화면에서 한 번에 설정 (박스 단위로 구획)
+st.markdown("### 분석 설정")
 
-with st.sidebar.expander("주소로 가까운 관측소 검색"):
-    st.caption(
-        "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다.  \n"
-        "**서로 다른 두 기관의 API 키**가 필요합니다."
-    )
-    kma_hub_key = st.text_input(
-        "기상청 API 허브 인증키",
-        type="password", key="kma_hub_key", value=_secret("KMA_HUB_KEY"),
-        help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회용, AWS 시간자료 키와 동일 계열)",
-    )
-    kakao_key = st.text_input(
-        "카카오 REST API 키",
-        type="password", key="kakao_key", value=_secret("KAKAO_REST_KEY"),
-        help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
-             "별도 승인 대기 없이 바로 사용 가능합니다.",
-    )
-    addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
+row1_col1, row1_col2 = st.columns(2)
 
-    if st.button("가까운 관측소 검색", key="btn_addr_search"):
-        if not kma_hub_key or not kakao_key:
-            st.error("기상청 API 허브 인증키와 카카오 REST API 키를 모두 입력하세요.")
-        elif not addr_input:
-            st.error("주소를 입력하세요.")
-        else:
-            with st.spinner("주소 검색 중..."):
-                lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, kakao_key)
-            if err:
-                st.error(f"주소 검색 실패: {err}")
-            else:
-                st.success(f"검색 위치: {disp_addr}  ({lat:.5f}, {lon:.5f})")
-                with st.spinner("관측소 DB 로딩 중..."):
-                    try:
-                        stn_db = _load_station_db(kma_hub_key)
-                    except Exception as e:
-                        stn_db = None
-                        st.error(f"관측소 DB 로딩 실패: {e}")
-
-                if stn_db is not None and len(stn_db) > 0:
-                    near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
-                    near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
-
-                    _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
-                                  'dist_km': '거리(km)', 'addr': '주소'}
-
-                    st.markdown("**종관(ASOS) 최근접 3개소**")
-                    st.dataframe(
-                        near_asos[list(_disp_cols)].rename(columns=_disp_cols)
-                            .style.format({'거리(km)': '{:.2f}'}),
-                        hide_index=True, width='stretch',
-                    )
-                    st.markdown("**방재(AWS) 최근접 3개소**")
-                    st.dataframe(
-                        near_aws[list(_disp_cols)].rename(columns=_disp_cols)
-                            .style.format({'거리(km)': '{:.2f}'}),
-                        hide_index=True, width='stretch',
-                    )
-                    st.caption(
-                        "ASOS는 아래 '관측소 선택'에서 해당 지점을 고르세요. "
-                        "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
-                    )
-
-st.sidebar.markdown("#### 2. 관측소 선택")
-obs_type = st.sidebar.radio(
-    "관측종류",
-    ["ASOS (종관)", "AWS (방재) — 현재 미지원"],
-    horizontal=True,
-    help=(
-        "ASOS: 기간(시작∼종료) 범위 조회 API 제공 → 5∼10년 장기분석 가능.\n"
-        "AWS: 단일 시점 조회만 지원되어 장기분석 불가 (자세한 사유는 선택 시 안내)."
-    ),
-)
-is_asos = obs_type.startswith("ASOS")
-
-aws_files = []   # ASOS 경로에서도 변수가 항상 정의되도록
-
-if is_asos:
-    region_db = ASOS_BY_REGION
-    region_list = list(region_db.keys())
-    default_region_idx = region_list.index("전남") if "전남" in region_list else 0
-    region = st.sidebar.selectbox("광역시도", region_list, index=default_region_idx)
-
-    # 해당 광역시도의 관측소 목록
-    stations_in_region = region_db[region]
-    stn_labels = [f"{name} ({sid}) · {start}" for sid, name, start in stations_in_region]
-    default_name = "목포" if region == "전남" else stations_in_region[0][1]
-    default_idx = next((i for i, s in enumerate(stations_in_region) if s[1] == default_name), 0)
-
-    selected_idx = st.sidebar.selectbox("관측소", range(len(stn_labels)),
-                                        format_func=lambda i: stn_labels[i],
-                                        index=default_idx)
-    sel = stations_in_region[selected_idx]
-    stn_id = sel[0]
-    stn_name = sel[1]
-    stn_start = sel[2]
-    st.sidebar.success(f"[ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
-else:
-    # AWS: API 대신 기상자료개방포털 CSV 업로드 방식
-    region = "—"
-    stn_id = None
-    stn_start = "2000-01-01"   # 기간선택 위젯이 깨지지 않도록 두는 더미 값
-
-    st.sidebar.info(
-        "**방재기상관측(AWS) — CSV 업로드 방식**\n\n"
-        "기상청 API는 단일 시점 조회만 지원하여 장기 분석이 불가합니다.  \n"
-        "[기상자료개방포털](https://data.kma.go.kr)에서 CSV를 직접 다운로드 후 "
-        "아래에 업로드하면 동일한 분석이 가능합니다."
-    )
-    with st.sidebar.expander("CSV 다운로드 방법"):
-        st.markdown(
-            "1. [기상자료개방포털](https://data.kma.go.kr) 접속  \n"
-            "2. **기후통계분석 → 방재기상관측 → 시간자료**  \n"
-            "3. 관측소·기간 선택 후 **CSV 다운로드**  \n"
-            "4. 연도별로 나눠 받은 경우 여러 파일을 동시에 업로드 가능  \n"
-            "5. 컬럼에 **풍향(deg)** 과 **풍속(m/s)** 이 포함된 파일이어야 합니다."
+with row1_col1:
+    with st.container(border=True):
+        st.markdown("**1. 관측소 선택**")
+        obs_type = st.radio(
+            "관측종류",
+            ["ASOS (종관)", "AWS (방재) — CSV 업로드"],
+            horizontal=True,
+            help=(
+                "ASOS: 기간(시작∼종료) 범위 조회 API 제공 → 5∼10년 장기분석 가능.\n"
+                "AWS: API는 단일 시점 조회만 지원되어 CSV 업로드 방식으로 분석합니다."
+            ),
         )
-    stn_name = st.sidebar.text_input("관측소 이름 (차트 표시용)", value="AWS 관측소")
-    aws_files = st.sidebar.file_uploader(
-        "AWS 시간자료 CSV (복수 파일 동시 업로드 가능)",
-        type=["csv"],
-        accept_multiple_files=True,
-        key="aws_csv",
-    )
-    if aws_files:
-        st.sidebar.success(f"{len(aws_files)}개 파일 업로드됨")
+        is_asos = obs_type.startswith("ASOS")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("#### 분석 기간")
-preset = st.sidebar.radio(
-    "기간 설정", ["최근 10년", "최근 5년", "사용자 지정"],
-    horizontal=True,
-    help="ICAO Annex 14 권고: 최소 5년 이상의 신뢰성 있는 기상통계자료",
-)
+        aws_files = []   # ASOS 경로에서도 변수가 항상 정의되도록
 
-# 종료월 = 오늘 기준 직전(완료된) 월 — 진행 중 월은 제외
-_today = date.today()
-_end_y, _end_m = (_today.year - 1, 12) if _today.month == 1 else (_today.year, _today.month - 1)
+        if is_asos:
+            region_db = ASOS_BY_REGION
+            region_list = list(region_db.keys())
+            default_region_idx = region_list.index("전남") if "전남" in region_list else 0
 
-def _months_back(ey, em, n_years):
-    """종료월 포함 정확히 (n_years × 12)개월이 되는 시작 연/월."""
-    idx = ey * 12 + (em - 1) - (n_years * 12 - 1)
-    return idx // 12, (idx % 12) + 1
+            c_region, c_station = st.columns(2)
+            with c_region:
+                region = st.selectbox("광역시도", region_list, index=default_region_idx)
 
-if preset == "최근 10년":
-    start_y, start_m = _months_back(_end_y, _end_m, 10)
-    end_y, end_m = _end_y, _end_m
-elif preset == "최근 5년":
-    start_y, start_m = _months_back(_end_y, _end_m, 5)
-    end_y, end_m = _end_y, _end_m
-else:  # 사용자 지정
-    # 선택된 관측소 관측 시작년도 이후만 허용
-    try:
-        stn_start_yr = int(stn_start.split("-")[0]) if stn_start and stn_start != "—" else 1960
-    except Exception:
-        stn_start_yr = 1960
-    yr_range = list(range(max(1960, stn_start_yr), _today.year + 1))
-    mo_range = list(range(1, 13))
+            # 해당 광역시도의 관측소 목록
+            stations_in_region = region_db[region]
+            stn_labels = [f"{name} ({sid}) · {start}" for sid, name, start in stations_in_region]
+            default_name = "목포" if region == "전남" else stations_in_region[0][1]
+            default_idx = next((i for i, s in enumerate(stations_in_region) if s[1] == default_name), 0)
 
-    cA, cB = st.sidebar.columns(2)
-    with cA:
-        default_start_y = max(yr_range[0], _today.year - 5)
-        start_y = st.selectbox("시작 연", yr_range,
-                               index=yr_range.index(default_start_y) if default_start_y in yr_range else 0)
-        start_m = st.selectbox("시작 월", mo_range, index=0)
-    with cB:
-        end_y = st.selectbox("종료 연", yr_range, index=len(yr_range) - 1)
-        end_m = st.selectbox("종료 월", mo_range, index=_end_m - 1)
+            with c_station:
+                selected_idx = st.selectbox("관측소", range(len(stn_labels)),
+                                            format_func=lambda i: stn_labels[i],
+                                            index=default_idx)
+            sel = stations_in_region[selected_idx]
+            stn_id = sel[0]
+            stn_name = sel[1]
+            stn_start = sel[2]
+            st.caption(f"[ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
+        else:
+            # AWS: API 대신 기상자료개방포털 CSV 업로드 방식
+            region = "—"
+            stn_id = None
+            stn_start = "2000-01-01"   # 기간선택 위젯이 깨지지 않도록 두는 더미 값
 
-# 날짜 객체 변환 (종료월은 말일)
-start_date = date(start_y, start_m, 1)
-_last_day = monthrange(end_y, end_m)[1]
-end_date = date(end_y, end_m, _last_day)
+            st.caption(
+                "기상청 API는 단일 시점 조회만 지원하여 장기 분석이 불가합니다. "
+                "[기상자료개방포털](https://data.kma.go.kr)에서 CSV를 직접 다운로드 후 "
+                "아래에 업로드하면 동일한 분석이 가능합니다."
+            )
+            with st.expander("CSV 다운로드 방법"):
+                st.markdown(
+                    "1. [기상자료개방포털](https://data.kma.go.kr) 접속  \n"
+                    "2. **기후통계분석 → 방재기상관측 → 시간자료**  \n"
+                    "3. 관측소·기간 선택 후 **CSV 다운로드**  \n"
+                    "4. 연도별로 나눠 받은 경우 여러 파일을 동시에 업로드 가능  \n"
+                    "5. 컬럼에 **풍향(deg)** 과 **풍속(m/s)** 이 포함된 파일이어야 합니다."
+                )
+            stn_name = st.text_input("관측소 이름 (차트 표시용)", value="AWS 관측소")
+            aws_files = st.file_uploader(
+                "AWS 시간자료 CSV (복수 파일 동시 업로드 가능)",
+                type=["csv"],
+                accept_multiple_files=True,
+                key="aws_csv",
+            )
+            if aws_files:
+                st.caption(f"{len(aws_files)}개 파일 업로드됨")
 
-# 유효성 및 요약
-_months = (end_y - start_y) * 12 + (end_m - start_m) + 1
-if start_date > end_date:
-    st.sidebar.error("시작이 종료보다 늦습니다.")
-elif _months < 60:
-    st.sidebar.warning(f"{_months}개월 (<5년) — ICAO 권고 기간 미달")
-    st.sidebar.caption(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월")
-else:
-    st.sidebar.success(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월 ({_months/12:.1f}년)")
+        with st.expander("주소로 가까운 관측소 검색"):
+            st.caption(
+                "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다.  \n"
+                "**서로 다른 두 기관의 API 키**가 필요합니다."
+            )
+            kma_hub_key = st.text_input(
+                "기상청 API 허브 인증키",
+                type="password", key="kma_hub_key", value=_secret("KMA_HUB_KEY"),
+                help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회용, AWS 시간자료 키와 동일 계열)",
+            )
+            kakao_key = st.text_input(
+                "카카오 REST API 키",
+                type="password", key="kakao_key", value=_secret("KAKAO_REST_KEY"),
+                help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
+                     "별도 승인 대기 없이 바로 사용 가능합니다.",
+            )
+            addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
 
-st.sidebar.markdown("#### 3. 측풍 허용치 (ICAO Doc. 9157)")
-rwy_length = st.sidebar.number_input("활주로 길이 (m)", min_value=300, max_value=5000, value=2000, step=100)
-low_friction = st.sidebar.checkbox("종방향 마찰계수 부족 (활주로 제동효과 불량)", value=False)
-auto_limit, auto_note = select_limit_by_rwy_length(rwy_length, low_friction)
-st.sidebar.info(f"자동 선택: **{auto_limit} kt** · {auto_note}")
-override = st.sidebar.checkbox("수동 선택 사용", value=False)
-if override:
-    primary_limit = st.sidebar.selectbox("측풍 허용치 (Knot)", CROSSWIND_LIMITS_KT,
+            if st.button("가까운 관측소 검색", key="btn_addr_search"):
+                if not kma_hub_key or not kakao_key:
+                    st.error("기상청 API 허브 인증키와 카카오 REST API 키를 모두 입력하세요.")
+                elif not addr_input:
+                    st.error("주소를 입력하세요.")
+                else:
+                    with st.spinner("주소 검색 중..."):
+                        lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, kakao_key)
+                    if err:
+                        st.error(f"주소 검색 실패: {err}")
+                    else:
+                        st.success(f"검색 위치: {disp_addr}  ({lat:.5f}, {lon:.5f})")
+                        with st.spinner("관측소 DB 로딩 중..."):
+                            try:
+                                stn_db = _load_station_db(kma_hub_key)
+                            except Exception as e:
+                                stn_db = None
+                                st.error(f"관측소 DB 로딩 실패: {e}")
+
+                        if stn_db is not None and len(stn_db) > 0:
+                            near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
+                            near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
+
+                            _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
+                                          'dist_km': '거리(km)', 'addr': '주소'}
+
+                            st.markdown("**종관(ASOS) 최근접 3개소**")
+                            st.dataframe(
+                                near_asos[list(_disp_cols)].rename(columns=_disp_cols)
+                                    .style.format({'거리(km)': '{:.2f}'}),
+                                hide_index=True, width='stretch',
+                            )
+                            st.markdown("**방재(AWS) 최근접 3개소**")
+                            st.dataframe(
+                                near_aws[list(_disp_cols)].rename(columns=_disp_cols)
+                                    .style.format({'거리(km)': '{:.2f}'}),
+                                hide_index=True, width='stretch',
+                            )
+                            st.caption(
+                                "ASOS는 위 '관측소 선택'에서 해당 지점을 고르세요. "
+                                "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
+                            )
+
+with row1_col2:
+    with st.container(border=True):
+        st.markdown("**2. 분석 기간**")
+        preset = st.radio(
+            "기간 설정", ["최근 10년", "최근 5년", "사용자 지정"],
+            horizontal=True,
+            help="ICAO Annex 14 권고: 최소 5년 이상의 신뢰성 있는 기상통계자료",
+        )
+
+        # 종료월 = 오늘 기준 직전(완료된) 월 — 진행 중 월은 제외
+        _today = date.today()
+        _end_y, _end_m = (_today.year - 1, 12) if _today.month == 1 else (_today.year, _today.month - 1)
+
+        def _months_back(ey, em, n_years):
+            """종료월 포함 정확히 (n_years × 12)개월이 되는 시작 연/월."""
+            idx = ey * 12 + (em - 1) - (n_years * 12 - 1)
+            return idx // 12, (idx % 12) + 1
+
+        if preset == "최근 10년":
+            start_y, start_m = _months_back(_end_y, _end_m, 10)
+            end_y, end_m = _end_y, _end_m
+        elif preset == "최근 5년":
+            start_y, start_m = _months_back(_end_y, _end_m, 5)
+            end_y, end_m = _end_y, _end_m
+        else:  # 사용자 지정
+            # 선택된 관측소 관측 시작년도 이후만 허용
+            try:
+                stn_start_yr = int(stn_start.split("-")[0]) if stn_start and stn_start != "—" else 1960
+            except Exception:
+                stn_start_yr = 1960
+            yr_range = list(range(max(1960, stn_start_yr), _today.year + 1))
+            mo_range = list(range(1, 13))
+
+            cA, cB = st.columns(2)
+            with cA:
+                default_start_y = max(yr_range[0], _today.year - 5)
+                start_y = st.selectbox("시작 연", yr_range,
+                                       index=yr_range.index(default_start_y) if default_start_y in yr_range else 0)
+                start_m = st.selectbox("시작 월", mo_range, index=0)
+            with cB:
+                end_y = st.selectbox("종료 연", yr_range, index=len(yr_range) - 1)
+                end_m = st.selectbox("종료 월", mo_range, index=_end_m - 1)
+
+        # 날짜 객체 변환 (종료월은 말일)
+        start_date = date(start_y, start_m, 1)
+        _last_day = monthrange(end_y, end_m)[1]
+        end_date = date(end_y, end_m, _last_day)
+
+        # 유효성 및 요약
+        _months = (end_y - start_y) * 12 + (end_m - start_m) + 1
+        if start_date > end_date:
+            st.error("시작이 종료보다 늦습니다.")
+        elif _months < 60:
+            st.warning(f"{_months}개월 (<5년) — ICAO 권고 기간 미달")
+            st.caption(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월")
+        else:
+            st.success(f"{start_date:%Y-%m} ~ {end_date:%Y-%m} · {_months}개월 ({_months/12:.1f}년)")
+
+row2_col1, row2_col2 = st.columns(2)
+
+with row2_col1:
+    with st.container(border=True):
+        st.markdown("**3. API 키**")
+        api_key = st.text_input("ASOS API Key (Decoding)", type="password",
+                                 value=_secret("ASOS_API_KEY"))
+        st.caption("공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키")
+
+with row2_col2:
+    with st.container(border=True):
+        st.markdown("**4. 측풍 허용치 (ICAO Doc. 9157)**")
+        rwy_length = st.number_input("활주로 길이 (m)", min_value=300, max_value=5000, value=2000, step=100)
+        low_friction = st.checkbox("종방향 마찰계수 부족 (활주로 제동효과 불량)", value=False)
+        auto_limit, auto_note = select_limit_by_rwy_length(rwy_length, low_friction)
+        st.caption(f"자동 선택: **{auto_limit} kt** · {auto_note}")
+        override = st.checkbox("수동 선택 사용", value=False)
+        if override:
+            primary_limit = st.selectbox("측풍 허용치 (Knot)", CROSSWIND_LIMITS_KT,
                                          index=CROSSWIND_LIMITS_KT.index(auto_limit))
-else:
-    primary_limit = auto_limit
+        else:
+            primary_limit = auto_limit
 
-if st.sidebar.button("데이터 캐시 삭제"):
-    st.cache_data.clear()
-    st.sidebar.info("캐시가 삭제되었습니다.")
+btn_col1, btn_col2 = st.columns([4, 1])
+with btn_col1:
+    run_clicked = st.button("분석 시작", type="primary", use_container_width=True)
+with btn_col2:
+    if st.button("데이터 캐시 삭제", use_container_width=True):
+        st.cache_data.clear()
+        st.info("캐시가 삭제되었습니다.")
+
+st.divider()
 
 # 3. 분석 실행
-if st.sidebar.button("분석 시작"):
+if run_clicked:
     df = None
     row_count = None
     _chart_start = start_date
