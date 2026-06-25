@@ -931,19 +931,27 @@ if run_clicked:
                 _ws_r  = df['ws_kt'].to_numpy(dtype=np.float32)
                 _N_r   = len(_wd_r)
 
-                # 16방위 bin (22.5° 간격, N=0°)
+                # Calm(정온) 분리 — 0.5 m/s 이하 (바람장미 전용 기준, 활주로 측풍분석의
+                # CALM_THRESHOLD_KT=3kt와는 별개). 0.5 m/s → 0.5*1.94384 ≈ 0.97 kt
+                _CALM_ROSE_KT = 0.5 * 1.94384
+                _calm_rose_mask = _ws_r <= _CALM_ROSE_KT
+                _calm_rose_pct  = float(_calm_rose_mask.sum()) / _N_r * 100.0
+
+                # 16방위 bin (22.5° 간격, N=0°) — Calm 제외한 유효바람만 방향 집계
                 _dir_ang  = np.arange(0, 360, 22.5)                    # [0, 22.5 … 337.5]
-                _dir_idx  = ((((_wd_r + 11.25) // 22.5) % 16)).astype(np.int32)
+                _wd_eff   = _wd_r[~_calm_rose_mask]
+                _ws_eff   = _ws_r[~_calm_rose_mask]
+                _dir_idx  = ((((_wd_eff + 11.25) // 22.5) % 16)).astype(np.int32)
 
                 # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21
                 _spd_labels = ["0–3 kt", "3–7 kt", "7–11 kt",
                                "11–17 kt", "17–21 kt", "≥21 kt"]
                 _spd_thresh = [3, 7, 11, 17, 21]                        # 오름차순 경계값
-                _spd_idx = np.zeros(_N_r, dtype=np.int32)
+                _spd_idx = np.zeros(len(_ws_eff), dtype=np.int32)
                 for _i, _t in enumerate(_spd_thresh):
-                    _spd_idx[_ws_r > _t] = _i + 1                      # 초과(>) 기준 bin 배정
+                    _spd_idx[_ws_eff > _t] = _i + 1                    # 초과(>) 기준 bin 배정
 
-                # 집계 (16 × 6) → 전체 관측 대비 %
+                # 집계 (16 × 6) → 전체 관측(Calm 포함) 대비 % → 막대 합 + Calm% = 100%
                 _rose_rows = []
                 for _d in range(16):
                     for _s in range(6):
@@ -957,7 +965,7 @@ if run_clicked:
 
                 # 이산 색상 (오름차순: 연한색 → 진한색)
                 _color_map = {
-                    "0–3 kt":   "#c6dbef",   # 연한 하늘색 (calm)
+                    "0–3 kt":   "#c6dbef",   # 연한 하늘색
                     "3–7 kt":   "#74c476",   # 연두
                     "7–11 kt":  "#fdd835",   # 노랑
                     "11–17 kt": "#fd8d3c",   # 주황
@@ -975,8 +983,11 @@ if run_clicked:
                     title=f"Wind Rose — {stn_name}  ({_chart_start:%Y-%m} ~ {_chart_end:%Y-%m})",
                     template="plotly_white",
                 )
+                _polar_domain = dict(x=[0.0, 0.74], y=[0.0, 1.0])      # 우측은 범례 공간
                 fig2.update_layout(
                     polar=dict(
+                        domain=_polar_domain,
+                        hole=0.16,             # 중앙에 Calm 표시용 빈 원
                         angularaxis=dict(
                             tickmode="array",
                             tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
@@ -994,7 +1005,18 @@ if run_clicked:
                     margin=dict(t=60, b=30, l=30, r=30),
                     height=540,
                 )
+                fig2.add_annotation(
+                    text=f"Calm<br>{_calm_rose_pct:.1f}%",
+                    x=(_polar_domain['x'][0] + _polar_domain['x'][1]) / 2,
+                    y=(_polar_domain['y'][0] + _polar_domain['y'][1]) / 2,
+                    xref="paper", yref="paper",
+                    showarrow=False,
+                    font=dict(size=14, color="#333"),
+                    align="center",
+                )
                 st.plotly_chart(fig2, width='stretch')
+                st.caption(f"중앙 원: 풍속 0.5 m/s(≈{_CALM_ROSE_KT:.2f} kt) 이하 정온(Calm) 비율 · "
+                           f"방위별 막대는 Calm을 제외한 유효바람 기준 (막대 합 + Calm = 100%)")
 
             with t4:
                 st.markdown("#### 16방위 × 풍속구간 빈도표 (%) — 논문 Table 6 양식")
