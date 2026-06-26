@@ -495,16 +495,25 @@ CALM_THRESHOLD_KT = 3.0              # 논문 §3.2 '무영향 데이터' 0~3 kn
 USABILITY_TARGET = 95.0              # ICAO 권고 최소 이용률
 TIE_TOLERANCE = 0.01                 # 동율 판정 허용오차 (%)
 MIN_SEPARATION_DEG = 30              # 2개 활주로 최소 각도 분리 (물리적 배치 제약)
+KT_TO_MS = 1 / 1.94384                # 1 kt = 0.51444... m/s
+
+def _kt2ms(kt):
+    """knot → m/s 변환."""
+    return kt * KT_TO_MS
+
+def fmt_kt(kt, decimals=1):
+    """'X kt (Y m/s)' 형식으로 동시 표기. 분석결과 전반의 풍속 표시에 공용으로 사용."""
+    return f"{kt:g} kt ({_kt2ms(kt):.{decimals}f} m/s)"
 
 def select_limit_by_rwy_length(length_m, low_friction=False):
-    """ICAO Doc. 9157 Table 1 기반 측풍 허용치 자동 선택."""
+    """ICAO Doc. 9157 Table 1 기반 측풍 허용치 자동 선택. 두 번째 반환값은 선택 조건 설명(풍속 표기 제외)."""
     if length_m >= 1500:
         if low_friction:
-            return 13, "≥1,500m · 종방향 마찰계수 부족 → 13 kt"
-        return 20, "≥1,500m → 20 kt"
+            return 13, "≥1,500m · 종방향 마찰계수 부족"
+        return 20, "≥1,500m"
     if length_m >= 1200:
-        return 13, "1,200~1,500m → 13 kt"
-    return 10, "<1,200m → 10 kt"
+        return 13, "1,200~1,500m"
+    return 10, "<1,200m"
 
 def rwy_name(deg):
     """방위각(0~179°)을 활주로 명칭(예: '15-33')으로 변환."""
@@ -612,7 +621,13 @@ def _build_freq_table(wd, ws, N_total):
     """16방위 × 5개 풍속구간 빈도표(%). 논문 Table 6 한국어 단위(노트) 버전."""
     dir_names = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    speed_labels = ["Calm 0–3 kt", "4–10 kt", "11–13 kt", "14–20 kt", ">20 kt"]
+    speed_labels = [
+        f"Calm 0–3 kt (0–{_kt2ms(3):.1f} m/s)",
+        f"4–10 kt ({_kt2ms(4):.1f}–{_kt2ms(10):.1f} m/s)",
+        f"11–13 kt ({_kt2ms(11):.1f}–{_kt2ms(13):.1f} m/s)",
+        f"14–20 kt ({_kt2ms(14):.1f}–{_kt2ms(20):.1f} m/s)",
+        f">20 kt (>{_kt2ms(20):.1f} m/s)",
+    ]
     speed_thresh = [3, 10, 13, 20]                    # 오름차순 경계값(초과 기준, 빈틈 없음)
     spd_idx = np.zeros(len(ws), dtype=np.int32)
     for i, t in enumerate(speed_thresh):
@@ -818,11 +833,12 @@ with row1_col2:
         rwy_length = st.number_input("활주로 길이 (m)", min_value=300, max_value=5000, value=2000, step=100)
         low_friction = st.checkbox("종방향 마찰계수 부족 (활주로 제동효과 불량)", value=False)
         auto_limit, auto_note = select_limit_by_rwy_length(rwy_length, low_friction)
-        st.caption(f"자동 선택: **{auto_limit} kt** · {auto_note}")
+        st.caption(f"자동 선택: **{fmt_kt(auto_limit)}** ({auto_note} 기준)")
         override = st.checkbox("수동 선택 사용", value=False)
         if override:
-            primary_limit = st.selectbox("측풍 허용치 (Knot)", CROSSWIND_LIMITS_KT,
-                                         index=CROSSWIND_LIMITS_KT.index(auto_limit))
+            primary_limit = st.selectbox("측풍 허용치", CROSSWIND_LIMITS_KT,
+                                         index=CROSSWIND_LIMITS_KT.index(auto_limit),
+                                         format_func=fmt_kt)
         else:
             primary_limit = auto_limit
 
@@ -886,19 +902,19 @@ if run_clicked:
             s0, s1, s2, s3, s4 = st.columns(5)
             s0.metric("분석 기간", f"{_chart_start:%Y-%m}", f"~ {_chart_end:%Y-%m}")
             s1.metric("전체 관측 시간", f"{A['N_total']:,} h")
-            s2.metric("Calm (0~3 kt)", f"{A['N_calm']:,} h", f"{A['calm_pct']:.2f}%")
+            s2.metric(f"Calm (0~{fmt_kt(CALM_THRESHOLD_KT)})", f"{A['N_calm']:,} h", f"{A['calm_pct']:.2f}%")
             s3.metric("유효 데이터", f"{A['N_eff']:,} h")
-            s4.metric("적용 측풍 허용치", f"{primary_limit} kt")
+            s4.metric("적용 측풍 허용치", fmt_kt(primary_limit))
             st.caption("※ Calm(무영향) 데이터는 논문 §3.2에 따라 활주로 방향 무관하게 '이용 가능'으로 집계됩니다.")
 
             # --- 주 결과(자동/수동 선택된 한계치) ---
-            st.subheader(f"분석 결과 · 허용치 {primary_limit} kt")
+            st.subheader(f"분석 결과 · 허용치 {fmt_kt(primary_limit)}")
             r = A['results'][primary_limit]
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("최적 활주로", rwy_name(r['best_angle']), f"{r['best_angle']}°")
             c2.metric("최대 이용률", f"{r['best_usab']:.3f}%",
                       "PASS" if r['pass'] else "FAIL")
-            c3.metric("평균 측풍", f"{r['mean_xwind']:.2f} kt")
+            c3.metric("평균 측풍", f"{r['mean_xwind']:.2f} kt", f"{_kt2ms(r['mean_xwind']):.2f} m/s", delta_color="off")
             c4.metric("동율 후보", f"{r['tied_count']}개",
                       "동율 처리 적용" if r['tied_count'] > 1 else "유일")
 
@@ -922,12 +938,14 @@ if run_clicked:
                 for lim in CROSSWIND_LIMITS_KT:
                     rr = A['results'][lim]
                     summary_rows.append({
-                        "허용치": f"{lim} kt",
+                        "허용치": fmt_kt(lim),
                         "최적 활주로": rwy_name(rr['best_angle']),
                         "방위각 (°)": rr['best_angle'],
                         "이용률 (%)": round(rr['best_usab'], 3),
                         "평균 측풍 (kt)": round(rr['mean_xwind'], 2),
+                        "평균 측풍 (m/s)": round(_kt2ms(rr['mean_xwind']), 2),
                         "최대 측풍 (kt)": round(rr['max_xwind'], 2),
+                        "최대 측풍 (m/s)": round(_kt2ms(rr['max_xwind']), 2),
                         "동율 후보수": rr['tied_count'],
                         "단일 판정": "PASS" if rr['pass'] else "FAIL",
                         "2개 조합 이용률 (%)": round(rr['pair_usab'], 3),
@@ -939,11 +957,11 @@ if run_clicked:
                 curve_df = pd.DataFrame({
                     "angle": np.tile(A['angles'], len(CROSSWIND_LIMITS_KT)),
                     "usability": np.concatenate([A['results'][l]['usability'] for l in CROSSWIND_LIMITS_KT]),
-                    "limit_kt": np.repeat([f"{l} kt" for l in CROSSWIND_LIMITS_KT], len(A['angles'])),
+                    "limit_kt": np.repeat([fmt_kt(l) for l in CROSSWIND_LIMITS_KT], len(A['angles'])),
                 })
                 fig1 = px.line(curve_df, x="angle", y="usability", color="limit_kt",
                                title="방향별 이용률 (허용치별 비교)",
-                               labels={"angle": "활주로 방위각 (°)", "usability": "이용률 (%)"})
+                               labels={"angle": "활주로 방위각 (°)", "usability": "이용률 (%)", "limit_kt": "허용치"})
                 fig1.add_hline(y=USABILITY_TARGET, line_dash="dash", line_color="red",
                                annotation_text="ICAO 95%", annotation_position="top right")
                 for lim in CROSSWIND_LIMITS_KT:
@@ -969,10 +987,16 @@ if run_clicked:
                 _ws_eff   = _ws_r[~_calm_rose_mask]
                 _dir_idx  = ((((_wd_eff + 11.25) // 22.5) % 16)).astype(np.int32)
 
-                # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21
-                _spd_labels = ["0–3 kt", "3–7 kt", "7–11 kt",
-                               "11–17 kt", "17–21 kt", "≥21 kt"]
+                # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21 — m/s 동시 표기
                 _spd_thresh = [3, 7, 11, 17, 21]                        # 오름차순 경계값
+                _spd_labels = [
+                    f"0–3 kt (0–{_kt2ms(3):.1f} m/s)",
+                    f"3–7 kt ({_kt2ms(3):.1f}–{_kt2ms(7):.1f} m/s)",
+                    f"7–11 kt ({_kt2ms(7):.1f}–{_kt2ms(11):.1f} m/s)",
+                    f"11–17 kt ({_kt2ms(11):.1f}–{_kt2ms(17):.1f} m/s)",
+                    f"17–21 kt ({_kt2ms(17):.1f}–{_kt2ms(21):.1f} m/s)",
+                    f"≥21 kt (≥{_kt2ms(21):.1f} m/s)",
+                ]
                 _spd_idx = np.zeros(len(_ws_eff), dtype=np.int32)
                 for _i, _t in enumerate(_spd_thresh):
                     _spd_idx[_ws_eff > _t] = _i + 1                    # 초과(>) 기준 bin 배정
@@ -990,14 +1014,8 @@ if run_clicked:
                 _df_rose = pd.DataFrame(_rose_rows)
 
                 # 이산 색상 (오름차순: 연한색 → 진한색)
-                _color_map = {
-                    "0–3 kt":   "#c6dbef",   # 연한 하늘색
-                    "3–7 kt":   "#74c476",   # 연두
-                    "7–11 kt":  "#fdd835",   # 노랑
-                    "11–17 kt": "#fd8d3c",   # 주황
-                    "17–21 kt": "#e31a1c",   # 빨강
-                    "≥21 kt":   "#67000d",   # 암적색 (강풍)
-                }
+                _color_seq = ["#c6dbef", "#74c476", "#fdd835", "#fd8d3c", "#e31a1c", "#67000d"]
+                _color_map = dict(zip(_spd_labels, _color_seq))
 
                 fig2 = px.bar_polar(
                     _df_rose,
@@ -1047,10 +1065,10 @@ if run_clicked:
             with t4:
                 st.markdown("#### 16방위 × 풍속구간 빈도표 (%) — 논문 Table 6 양식")
                 st.dataframe(A['freq_table'], width='stretch')
-                st.caption(f"합계 100% 기준 · Calm(0~3 kt) 비율: {A['calm_pct']:.2f}%")
+                st.caption(f"합계 100% 기준 · Calm(0~{fmt_kt(CALM_THRESHOLD_KT)}) 비율: {A['calm_pct']:.2f}%")
 
             with t5:
-                st.markdown(f"#### 2개 활주로 최적 조합 (허용치 {primary_limit} kt)")
+                st.markdown(f"#### 2개 활주로 최적 조합 (허용치 {fmt_kt(primary_limit)})")
                 st.caption(f"※ 최소 각도 분리 {MIN_SEPARATION_DEG}° 제약 적용 "
                            f"(물리적 배치 가능성 고려)")
                 r = A['results'][primary_limit]
@@ -1086,7 +1104,7 @@ if run_clicked:
                         "활주로": rwy_name(i),
                     }
                     for lim in CROSSWIND_LIMITS_KT:
-                        row[f"{lim} kt 이용률 (%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
+                        row[f"{fmt_kt(lim)} 이용률 (%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
                     rows.append(row)
                 df_table = pd.DataFrame(rows)
 
@@ -1105,14 +1123,15 @@ if run_clicked:
                 st.markdown("##### 허용치별 최적 방위각 (표 기준)")
                 best_rows = []
                 for lim in CROSSWIND_LIMITS_KT:
-                    sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", f"{lim} kt 이용률 (%)"]]
-                    top = sub.loc[sub[f"{lim} kt 이용률 (%)"].idxmax()]
+                    col = f"{fmt_kt(lim)} 이용률 (%)"
+                    sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", col]]
+                    top = sub.loc[sub[col].idxmax()]
                     best_rows.append({
-                        "허용치": f"{lim} kt",
+                        "허용치": fmt_kt(lim),
                         "최적 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
                         "활주로": top['활주로'],
-                        "이용률 (%)": f"{top[f'{lim} kt 이용률 (%)']:.2f}",
-                        "판정": "PASS" if top[f'{lim} kt 이용률 (%)'] >= USABILITY_TARGET else "FAIL",
+                        "이용률 (%)": f"{top[col]:.2f}",
+                        "판정": "PASS" if top[col] >= USABILITY_TARGET else "FAIL",
                     })
                 st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
 
