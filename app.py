@@ -516,8 +516,17 @@ def rwy_name(deg):
     lo, hi = (a, b) if a < b else (b, a)
     return f"{lo:02d}-{hi:02d}"
 
+RWY_ANGLE_STEP_DEG = 10   # 활주로 명칭(예: 17-35)은 10° 단위로만 존재 → 분석도 10° 격자로 통일
+
 def analyze_runway(df):
-    """전체 분석: calm 처리 + 3개 허용치 + 동율 처리 + 2개 활주로 + 빈도표."""
+    """전체 분석: calm 처리 + 3개 허용치 + 동율 처리 + 2개 활주로 + 빈도표.
+    활주로 명칭은 방위각을 10° 단위로 반올림해 정해지므로(예: 166°→17, 170°→17),
+    분석 자체를 10° 격자(0,10,…,170)에서만 수행해 '최적 활주로'로 표시되는 명칭과
+    실제로 평가된 각도가 항상 정확히 일치하도록 한다 (1° 단위로 찾은 뒤 반올림하면
+    표시된 활주로 명칭이 가리키는 각도와 실제 이용률 산출 각도가 달라지는 문제가 있었음).
+    또한 활주로는 실제로 하나(또는 한 쌍)만 지을 수 있으므로, 최적 각도는 10/13/20kt
+    세 허용치의 이용률을 모두 합산한 결합 기준으로 공동 선정한다. 즉 한계치별로
+    서로 다른 '최적 활주로'를 추천하지 않고, 동일한 각도를 각 한계치에서 평가한다."""
     ws = df['ws_kt'].to_numpy(dtype=np.float32)
     wd = df['wd'].to_numpy(dtype=np.float32)
     N_total = len(ws)
@@ -529,51 +538,68 @@ def analyze_runway(df):
     eff_wd = wd[~calm_mask]
     N_eff = len(eff_ws)
 
-    # 2) 유효 바람에 대한 측풍 행렬 (N_eff × 180)
-    angles = np.arange(0, 180, dtype=np.int32)
+    # 2) 유효 바람에 대한 측풍 행렬 (N_eff × 18, 10° 격자)
+    angles = np.arange(0, 180, RWY_ANGLE_STEP_DEG, dtype=np.int32)   # [0,10,...,170]
+    n_ang = len(angles)
     diff = np.radians(eff_wd[:, None] - angles[None, :])
     xwind = np.abs(eff_ws[:, None] * np.sin(diff)).astype(np.float32)  # |측풍|, knots
 
+    # 3) 한계치별 단일/2개 활주로 이용률을 모두 먼저 계산 (배열 인덱스 기준)
+    usab_by_limit = {}
+    pair_usab_by_limit = {}
+    for limit in CROSSWIND_LIMITS_KT:
+        coverage = xwind <= limit                # (N_eff, n_ang) bool
+        eff_covered = coverage.sum(axis=0)       # (n_ang,)
+        usab_by_limit[limit] = (N_calm + eff_covered) / N_total * 100.0
+
+        # 2개 활주로 분석 (합집합 이용률): |A∪B| = |A| + |B| - |A∩B|, 행렬곱으로 벡터화
+        Cf = coverage.astype(np.float32)
+        inter = Cf.T @ Cf                                       # (n_ang,n_ang)
+        union = eff_covered[:, None] + eff_covered[None, :] - inter
+        pair_usab_by_limit[limit] = (N_calm + union) / N_total * 100.0   # (n_ang,n_ang)
+
+    # 4) 단일 최적 각도(인덱스) — 10/13/20kt 이용률 합산(결합 기준)으로 공동 선정
+    combined_usab = sum(usab_by_limit[l] for l in CROSSWIND_LIMITS_KT)
+    joint_u_max = float(combined_usab.max())
+    joint_tied_idx = np.where(combined_usab >= joint_u_max - TIE_TOLERANCE)[0]
+    mean_xw_tied = xwind[:, joint_tied_idx].mean(axis=0)
+    best_idx = int(joint_tied_idx[int(np.argmin(mean_xw_tied))])
+    joint_best_angle = int(angles[best_idx])                    # 실제 각도값(0~170)으로 환산
+
+    # 5) 2개 활주로 최적 조합(인덱스)도 동일하게 결합 기준으로 공동 선정
+    combined_pair_usab = sum(pair_usab_by_limit[l] for l in CROSSWIND_LIMITS_KT)
+    sep = np.abs(angles[:, None] - angles[None, :])
+    sep_ok = (sep >= MIN_SEPARATION_DEG) & (sep <= 180 - MIN_SEPARATION_DEG)
+    masked = np.where(sep_ok, combined_pair_usab, -1.0)
+    flat = int(np.argmax(masked))
+    pi_idx, pj_idx = int(flat // n_ang), int(flat % n_ang)
+    pi, pj = int(angles[pi_idx]), int(angles[pj_idx])           # 실제 각도값으로 환산
+    joint_pair_angles = (min(pi, pj), max(pi, pj))
+    pi_idx, pj_idx = int(np.where(angles == joint_pair_angles[0])[0][0]), \
+                     int(np.where(angles == joint_pair_angles[1])[0][0])
+
+    # 6) 공동 선정된 각도를 한계치별로 평가 (동일 각도, 한계치별 이용률만 다름)
     results = {}
     for limit in CROSSWIND_LIMITS_KT:
-        coverage = xwind <= limit                # (N_eff, 180) bool
-        eff_covered = coverage.sum(axis=0)       # (180,)
-        # 이용률 = (calm + 유효_허용측풍 이내) / 전체
-        usab = (N_calm + eff_covered) / N_total * 100.0
-
-        # 3) 동율(Tie-breaking) — 논문 §3.2
-        u_max = float(usab.max())
-        tied = np.where(usab >= u_max - TIE_TOLERANCE)[0]
-        mean_xw_tied = xwind[:, tied].mean(axis=0)
-        best_angle = int(tied[int(np.argmin(mean_xw_tied))])
-
-        # 5) 2개 활주로 분석 (합집합 이용률)
-        # |A∪B| = |A| + |B| - |A∩B|, 행렬곱으로 벡터화
-        Cf = coverage.astype(np.float32)
-        inter = Cf.T @ Cf                                       # (180,180)
-        union = eff_covered[:, None] + eff_covered[None, :] - inter
-        pair_usab = (N_calm + union) / N_total * 100.0          # (180,180)
-        sep = np.abs(angles[:, None] - angles[None, :])
-        sep_ok = (sep >= MIN_SEPARATION_DEG) & (sep <= 180 - MIN_SEPARATION_DEG)
-        masked = np.where(sep_ok, pair_usab, -1.0)
-        flat = int(np.argmax(masked))
-        i, j = int(flat // 180), int(flat % 180)
-        pair_best_u = float(pair_usab[i, j])
+        usab = usab_by_limit[limit]
+        pair_usab = pair_usab_by_limit[limit]
+        u_at_best = float(usab[best_idx])
+        pair_u = float(pair_usab[pi_idx, pj_idx])
 
         results[limit] = {
             'usability': usab,
-            'best_angle': best_angle,
-            'best_usab': u_max,
-            'tied_count': len(tied),
-            'mean_xwind': float(xwind[:, best_angle].mean()),
-            'max_xwind': float(xwind[:, best_angle].max()),
-            'pass': u_max >= USABILITY_TARGET,
-            'pair_angles': (min(i, j), max(i, j)),
-            'pair_usab': pair_best_u,
-            'pair_pass': pair_best_u >= USABILITY_TARGET,
+            'best_angle': joint_best_angle,
+            'best_usab': u_at_best,
+            'tied_count': len(joint_tied_idx),
+            'mean_xwind': float(xwind[:, best_idx].mean()),
+            'max_xwind': float(xwind[:, best_idx].max()),
+            'pass': u_at_best >= USABILITY_TARGET,
+            'pair_angles': joint_pair_angles,
+            'pair_usab': pair_u,
+            'pair_pass': pair_u >= USABILITY_TARGET,
         }
 
-    # 6) 16방위 × 풍속 빈도표 — 논문 Table 6
+    # 7) 16방위 × 풍속 빈도표 — 논문 Table 6
     freq_table = _build_freq_table(wd, ws, N_total)
 
     return {
@@ -885,9 +911,9 @@ if run_clicked:
                 )
 
             # --- 탭 ---
-            t1, t2, t3, t4, t5, t6 = st.tabs([
+            t1, t2, t3, t4, t5 = st.tabs([
                 "3개 허용치 종합", "이용률 곡선", "바람장미",
-                "16방위 빈도표", "2개 활주로 분석", "방위각 상세표"
+                "16방위 빈도표", "2개 활주로 분석"
             ])
 
             with t1:
@@ -1038,63 +1064,6 @@ if run_clicked:
                     f"단일 활주로 최대 이용률: **{r['best_usab']:.3f}%** → "
                     f"2개 조합 이용률: **{r['pair_usab']:.3f}%** "
                     f"(개선 +{r['pair_usab']-r['best_usab']:.3f}%p)"
-                )
-
-            with t6:
-                st.markdown("#### 방위각 간격별 이용률 상세표")
-                st.caption("각 행은 활주로 방위(방향 ↔ 대응방향) 쌍이며, 허용측풍별 이용률(%)을 나타냅니다. 95% 미달은 빨강, 이상은 초록으로 강조됩니다.")
-                col_a, col_b = st.columns([1, 3])
-                with col_a:
-                    step = st.selectbox("각도 간격 (°)", [1, 5, 10, 20, 30], index=2, key="step_table")
-
-                headings = np.arange(step, 181, step, dtype=int)   # step, 2·step, ..., ≤180
-                rows = []
-                for h in headings:
-                    i = int(h % 180)                               # 180° ≡ 0° (동일 활주로)
-                    rec = int(h + 180)                             # 10→190, ..., 180→360
-                    row = {
-                        "방향 (°)": int(h),
-                        "대응방향 (°)": rec,
-                        "활주로": rwy_name(i),
-                    }
-                    for lim in CROSSWIND_LIMITS_KT:
-                        row[f"{lim} kt 이용률 (%)"] = round(float(A['results'][lim]['usability'][i]), 2)
-                    rows.append(row)
-                df_table = pd.DataFrame(rows)
-
-                # 95% 기준 색상 강조 (pandas 3.x: Styler.map 사용)
-                kt_cols = [c for c in df_table.columns if "이용률" in c]
-                def _hl(v):
-                    if isinstance(v, (int, float)):
-                        if v >= USABILITY_TARGET:
-                            return "background-color: #d4edda; color: #155724;"
-                        return "background-color: #f8d7da; color: #721c24;"
-                    return ""
-                styled = df_table.style.map(_hl, subset=kt_cols).format({c: "{:.2f}" for c in kt_cols})
-                st.dataframe(styled, width='stretch', hide_index=True)
-
-                # 최적 방향 요약
-                st.markdown("##### 허용치별 최적 방위각 (표 기준)")
-                best_rows = []
-                for lim in CROSSWIND_LIMITS_KT:
-                    sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", f"{lim} kt 이용률 (%)"]]
-                    top = sub.loc[sub[f"{lim} kt 이용률 (%)"].idxmax()]
-                    best_rows.append({
-                        "허용치": f"{lim} kt",
-                        "최적 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
-                        "활주로": top['활주로'],
-                        "이용률 (%)": f"{top[f'{lim} kt 이용률 (%)']:.2f}",
-                        "판정": "PASS" if top[f'{lim} kt 이용률 (%)'] >= USABILITY_TARGET else "FAIL",
-                    })
-                st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
-
-                # CSV 다운로드
-                csv_bytes = df_table.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-                st.download_button(
-                    "CSV 다운로드",
-                    csv_bytes,
-                    file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step{step}.csv",
-                    mime="text/csv",
                 )
 
             # ── 데이터 품질 검토 ───────────────────────────────────────
