@@ -911,9 +911,9 @@ if run_clicked:
                 )
 
             # --- 탭 ---
-            t1, t2, t3, t4, t5 = st.tabs([
+            t1, t2, t3, t4, t5, t6 = st.tabs([
                 "3개 허용치 종합", "이용률 곡선", "바람장미",
-                "16방위 빈도표", "2개 활주로 분석"
+                "16방위 빈도표", "2개 활주로 분석", "방위각 상세표"
             ])
 
             with t1:
@@ -1064,6 +1064,66 @@ if run_clicked:
                     f"단일 활주로 최대 이용률: **{r['best_usab']:.3f}%** → "
                     f"2개 조합 이용률: **{r['pair_usab']:.3f}%** "
                     f"(개선 +{r['pair_usab']-r['best_usab']:.3f}%p)"
+                )
+
+            with t6:
+                st.markdown("#### 방위각 간격별 이용률 상세표 (10° 간격)")
+                st.caption(
+                    "각 행은 활주로 방위(방향 ↔ 대응방향) 쌍이며, 허용측풍별 이용률(%)을 나타냅니다. "
+                    "95% 미달은 빨강, 이상은 초록으로 강조됩니다. "
+                    "(활주로 명칭이 10° 단위로만 존재하므로 분석도 10° 간격으로 고정됩니다.)"
+                )
+
+                headings = np.arange(RWY_ANGLE_STEP_DEG, 181, RWY_ANGLE_STEP_DEG, dtype=int)  # 10,20,...,180
+                rows = []
+                for h in headings:
+                    i = int(h % 180)                               # 180° ≡ 0° (동일 활주로)
+                    idx = i // RWY_ANGLE_STEP_DEG                  # usability 배열 인덱스 (10° 격자)
+                    rec = int(h + 180)                              # 10→190, ..., 180→360
+                    row = {
+                        "방향 (°)": int(h),
+                        "대응방향 (°)": rec,
+                        "활주로": rwy_name(i),
+                    }
+                    for lim in CROSSWIND_LIMITS_KT:
+                        row[f"{lim} kt 이용률 (%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
+                    rows.append(row)
+                df_table = pd.DataFrame(rows)
+
+                # 95% 기준 색상 강조 (pandas 3.x: Styler.map 사용)
+                kt_cols = [c for c in df_table.columns if "이용률" in c]
+                def _hl(v):
+                    if isinstance(v, (int, float)):
+                        if v >= USABILITY_TARGET:
+                            return "background-color: #d4edda; color: #155724;"
+                        return "background-color: #f8d7da; color: #721c24;"
+                    return ""
+                styled = df_table.style.map(_hl, subset=kt_cols).format({c: "{:.2f}" for c in kt_cols})
+                st.dataframe(styled, width='stretch', hide_index=True)
+
+                # 최적 방향 요약
+                st.markdown("##### 허용치별 최적 방위각 (표 기준)")
+                best_rows = []
+                for lim in CROSSWIND_LIMITS_KT:
+                    sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", f"{lim} kt 이용률 (%)"]]
+                    top = sub.loc[sub[f"{lim} kt 이용률 (%)"].idxmax()]
+                    best_rows.append({
+                        "허용치": f"{lim} kt",
+                        "최적 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
+                        "활주로": top['활주로'],
+                        "이용률 (%)": f"{top[f'{lim} kt 이용률 (%)']:.2f}",
+                        "판정": "PASS" if top[f'{lim} kt 이용률 (%)'] >= USABILITY_TARGET else "FAIL",
+                    })
+                st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
+
+                # CSV 다운로드
+                csv_bytes = df_table.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+                st.download_button(
+                    "CSV 다운로드",
+                    csv_bytes,
+                    file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step10.csv",
+                    mime="text/csv",
+                    key="dl_detail_csv",
                 )
 
             # ── 데이터 품질 검토 ───────────────────────────────────────
