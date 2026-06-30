@@ -643,6 +643,318 @@ def _build_freq_table(wd, ws, N_total):
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
     return df_out
 
+
+# ── [검토서(Word) 생성] ──────────────────────────────────────────────────
+# 화면용 Plotly 차트와 별개로, 보고서 삽입용 정적 이미지는 matplotlib로 렌더링한다.
+# kaleido(Plotly 정적변환)는 Chrome 브라우저 의존성이 있어 Streamlit Cloud(Linux)
+# 배포 환경에서 불안정하므로 사용하지 않는다. matplotlib(Agg)은 브라우저 없이 동작.
+# 차트 내부 라벨은 한글 폰트 누락(배포 환경 tofu) 회피를 위해 영문/기호로 표기하고,
+# 문서 본문·표·제목의 한글은 Word 자체 폰트(맑은 고딕)로 렌더링한다.
+
+def _render_windrose_png(wd, ws_kt):
+    """16방위 × 6풍속구간 풍배도 → PNG bytes (matplotlib polar stacked bar)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    N = len(wd)
+    calm_kt = 0.5 * 1.94384
+    calm_mask = ws_kt <= calm_kt
+    calm_pct = float(calm_mask.sum()) / N * 100.0
+
+    wd_eff = wd[~calm_mask]
+    ws_eff = ws_kt[~calm_mask]
+    dir_idx = (((wd_eff + 11.25) // 22.5) % 16).astype(int)
+
+    spd_thresh = [3, 7, 11, 17, 21]
+    spd_labels = ["0-3 kt", "3-7 kt", "7-11 kt", "11-17 kt", "17-21 kt", ">=21 kt"]
+    colors = ["#c6dbef", "#74c476", "#fdd835", "#fd8d3c", "#e31a1c", "#67000d"]
+    spd_idx = np.zeros(len(ws_eff), dtype=int)
+    for i, t in enumerate(spd_thresh):
+        spd_idx[ws_eff > t] = i + 1
+
+    freq = np.zeros((16, 6))
+    for d in range(16):
+        for s in range(6):
+            freq[d, s] = ((dir_idx == d) & (spd_idx == s)).sum() / N * 100.0
+
+    theta = np.deg2rad(np.arange(0, 360, 22.5))
+    width = np.deg2rad(22.5) * 0.9
+
+    fig = plt.figure(figsize=(6.2, 6.2), dpi=150)
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)               # 시계방향
+    bottom = np.zeros(16)
+    for s in range(6):
+        ax.bar(theta, freq[:, s], width=width, bottom=bottom,
+               color=colors[s], edgecolor="white", linewidth=0.3, label=spd_labels[s])
+        bottom += freq[:, s]
+    ax.set_xticks(np.deg2rad([0, 45, 90, 135, 180, 225, 270, 315]))
+    ax.set_xticklabels(["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
+    ax.set_rlabel_position(135)
+    ax.tick_params(labelsize=8)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
+    ax.text(0.5, 0.5, f"Calm\n{calm_pct:.1f}%", transform=ax.transAxes,
+            ha="center", va="center", fontsize=9,
+            bbox=dict(boxstyle="circle", fc="white", ec="#888", alpha=0.9))
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.05), fontsize=7,
+              title="Wind Speed", title_fontsize=8)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _render_usability_png(A):
+    """방위각별 이용률 곡선(허용치 3종) → PNG bytes (matplotlib)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    angles = A['angles']
+    line_colors = {10: "#1f77b4", 13: "#2ca02c", 20: "#d62728"}
+    fig, ax = plt.subplots(figsize=(7.4, 4.2), dpi=150)
+    for lim in CROSSWIND_LIMITS_KT:
+        u = A['results'][lim]['usability']
+        ax.plot(angles, u, marker="o", ms=3, color=line_colors.get(lim),
+                label=f"{lim} kt ({_kt2ms(lim):.1f} m/s)")
+    ax.axhline(USABILITY_TARGET, ls="--", color="red", lw=1)
+    ax.text(angles[-1], USABILITY_TARGET, " ICAO 95%", color="red",
+            va="bottom", ha="right", fontsize=8)
+    for lim in CROSSWIND_LIMITS_KT:
+        ax.axvline(A['results'][lim]['best_angle'], ls=":", color="gray", alpha=0.3)
+    ax.set_xlabel("Runway Azimuth (deg)")
+    ax.set_ylabel("Usability (%)")
+    ax.set_title("Usability by Runway Direction")
+    ax.set_xticks(np.arange(0, 180, 20))
+    ax.grid(alpha=0.3)
+    ax.legend(title="Crosswind Limit", fontsize=8, title_fontsize=8)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _build_detail_table(A):
+    """방위각 10° 간격 이용률 상세표 (t6과 동일 로직)."""
+    rows = []
+    for h in np.arange(RWY_ANGLE_STEP_DEG, 181, RWY_ANGLE_STEP_DEG, dtype=int):
+        i = int(h % 180)
+        idx = i // RWY_ANGLE_STEP_DEG
+        row = {"방향(°)": int(h), "대응방향(°)": int(h + 180), "활주로": rwy_name(i)}
+        for lim in CROSSWIND_LIMITS_KT:
+            row[f"{lim}kt 이용률(%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_summary_table(A):
+    """허용치별 종합표 (t1 핵심 항목)."""
+    rows = []
+    for lim in CROSSWIND_LIMITS_KT:
+        rr = A['results'][lim]
+        rows.append({
+            "허용치": fmt_kt(lim),
+            "최적 활주로": rwy_name(rr['best_angle']),
+            "방위각(°)": rr['best_angle'],
+            "이용률(%)": round(rr['best_usab'], 3),
+            "평균측풍(kt)": round(rr['mean_xwind'], 2),
+            "평균측풍(m/s)": round(_kt2ms(rr['mean_xwind']), 2),
+            "최대측풍(kt)": round(rr['max_xwind'], 2),
+            "최대측풍(m/s)": round(_kt2ms(rr['max_xwind']), 2),
+            "단일판정": "적합" if rr['pass'] else "부적합",
+        })
+    return pd.DataFrame(rows)
+
+
+def _docx_set_korean_font(doc, name="맑은 고딕", size=10):
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+    style = doc.styles['Normal']
+    style.font.name = name
+    style.font.size = Pt(size)
+    rpr = style.element.get_or_add_rPr()
+    rfonts = rpr.get_or_add_rFonts()
+    rfonts.set(qn('w:eastAsia'), name)
+
+
+def _shade_cell(cell, hex_color):
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:fill'), hex_color)
+    tcPr.append(shd)
+
+
+def _add_df_table(doc, df, header_bg="D9E1F2", font_size=10):
+    from docx.shared import Pt
+    cols = list(df.columns)
+    t = doc.add_table(rows=1, cols=len(cols))
+    t.style = "Table Grid"
+    t.autofit = True
+    hdr = t.rows[0].cells
+    for j, c in enumerate(cols):
+        hdr[j].text = str(c)
+        _shade_cell(hdr[j], header_bg)
+        for p in hdr[j].paragraphs:
+            for run in p.runs:
+                run.font.bold = True
+                run.font.size = Pt(font_size)
+    for _, rowdata in df.iterrows():
+        cells = t.add_row().cells
+        for j, c in enumerate(cols):
+            v = rowdata[c]
+            cells[j].text = "" if pd.isna(v) else str(v)
+            for p in cells[j].paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(font_size)
+    return t
+
+
+def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
+                      n_raw, n_valid, n_invalid):
+    """분석 결과(A)와 원자료(df)로 활주로 방향 검토서(.docx) bytes 생성."""
+    from docx import Document
+    from docx.shared import Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+    _docx_set_korean_font(doc)
+
+    period_months = ((chart_end.year - chart_start.year) * 12
+                     + (chart_end.month - chart_start.month) + 1)
+    r = A['results'][primary_limit]
+
+    title = doc.add_heading("활주로 방향 검토서", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sub = doc.add_paragraph(
+        f"대상 관측소: {stn_name}    |    분석기간: "
+        f"{chart_start:%Y-%m-%d} ~ {chart_end:%Y-%m-%d}"
+    )
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
+
+    # 1. 검토 개요 (서술 항목은 생성 후 Word에서 직접 편집)
+    doc.add_heading("1. 검토 개요", level=1)
+    _add_df_table(doc, pd.DataFrame([
+        {"항목": "공항(시설)명", "내용": "[ 작성 ]"},
+        {"항목": "검토 목적", "내용": "[ 작성 ]"},
+        {"항목": "의뢰기관", "내용": "[ 작성 ]"},
+        {"항목": "대상 관측소", "내용": stn_name},
+        {"항목": "분석기간",
+         "내용": f"{chart_start:%Y-%m-%d} ~ {chart_end:%Y-%m-%d} ({period_months}개월)"},
+        {"항목": "검토기준", "내용": "ICAO Annex 14 / Doc.9157 Airport Design Manual Part 1"},
+    ]))
+    doc.add_paragraph()
+
+    # 2. 기상자료 현황
+    doc.add_heading("2. 기상자료 현황", level=1)
+    valid_pct = n_valid / n_raw * 100 if n_raw else 0
+    miss_pct = n_invalid / n_raw * 100 if n_raw else 0
+    _add_df_table(doc, pd.DataFrame([
+        {"구분": "전체 수집 행", "값": f"{n_raw:,} 행"},
+        {"구분": "유효 데이터 (풍향+풍속 존재)", "값": f"{n_valid:,} 행 ({valid_pct:.1f}%)"},
+        {"구분": "결측 데이터", "값": f"{n_invalid:,} 행 ({miss_pct:.1f}%)"},
+        {"구분": "전체 관측시간", "값": f"{A['N_total']:,} 시간"},
+        {"구분": f"Calm (0~{fmt_kt(CALM_THRESHOLD_KT)})",
+         "값": f"{A['N_calm']:,} 시간 ({A['calm_pct']:.2f}%)"},
+        {"구분": "유효 풍황 데이터", "값": f"{A['N_eff']:,} 시간"},
+    ]))
+    doc.add_paragraph()
+
+    # 3. 분석 방법
+    doc.add_heading("3. 분석 방법", level=1)
+    doc.add_paragraph(
+        "본 검토는 국제민간항공기구(ICAO) Annex 14 및 Doc.9157 Airport Design Manual에 따라 "
+        "활주로 방향별 측풍 이용률(usability factor)을 산정하였다. 측풍 허용치는 항공기 "
+        "기준활주로길이에 따라 다음과 같이 적용한다."
+    )
+    _add_df_table(doc, pd.DataFrame([
+        {"측풍 허용치": "20 kt (10.3 m/s)", "적용 대상": "기준활주로길이 1,500m 이상"},
+        {"측풍 허용치": "13 kt (6.7 m/s)", "적용 대상": "1,200m 이상 1,500m 미만 (또는 종방향 마찰계수 부족)"},
+        {"측풍 허용치": "10 kt (5.1 m/s)", "적용 대상": "1,200m 미만"},
+    ]))
+    doc.add_paragraph(
+        f"풍속 {fmt_kt(CALM_THRESHOLD_KT)} 이하의 무풍(Calm) 상태는 활주로 방향과 무관하게 "
+        "이용 가능한 것으로 집계하였다. 이용률은 다음 식으로 산정한다."
+    )
+    eq = doc.add_paragraph(
+        "이용률(%) = (Calm 관측수 + 측풍성분 ≤ 허용치 관측수) ÷ 전체 관측수 × 100"
+    )
+    eq.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(
+        "활주로 명칭은 10° 단위로만 부여되므로 분석 격자도 10° 간격(0°~170°, 18방향)으로 고정하였다. "
+        "최적 활주로 방향은 세 허용치(10·13·20kt)의 이용률을 모두 합산한 결합 기준으로 "
+        "단일 방향을 공동 선정하였다."
+    )
+    doc.add_paragraph()
+
+    # 4. 분석 결과
+    doc.add_heading("4. 분석 결과", level=1)
+
+    doc.add_heading("4.1 풍배도 (Wind Rose)", level=2)
+    rose_png = _render_windrose_png(
+        df['wd'].to_numpy(dtype=float), df['ws_kt'].to_numpy(dtype=float))
+    doc.add_picture(io.BytesIO(rose_png), width=Cm(11.5))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    cap = doc.add_paragraph("그림 1. 16방위 풍배도 (중앙 원: 0.5 m/s 이하 정온 비율)")
+    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("4.2 방향별 이용률 곡선", level=2)
+    doc.add_picture(io.BytesIO(_render_usability_png(A)), width=Cm(14.5))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    cap2 = doc.add_paragraph("그림 2. 활주로 방위각별 측풍 이용률 (허용치별 비교)")
+    cap2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("4.3 16방위 풍향·풍속 빈도표 (%)", level=2)
+    ft = A['freq_table'].reset_index().rename(columns={'index': '방위'})
+    _add_df_table(doc, ft, font_size=8)
+
+    doc.add_heading("4.4 방위각별 이용률 상세표 (10° 간격)", level=2)
+    _add_df_table(doc, _build_detail_table(A), font_size=9)
+    doc.add_paragraph(
+        f"※ 측풍 허용치: 10kt=5.1m/s, 13kt=6.7m/s, 20kt=10.3m/s · "
+        f"{USABILITY_TARGET:g}% 이상 적합 / 미만 부적합"
+    )
+
+    doc.add_heading("4.5 측풍 허용치별 종합", level=2)
+    _add_df_table(doc, _build_summary_table(A), font_size=8)
+
+    # 5. 최적 활주로 방향 선정
+    doc.add_heading("5. 최적 활주로 방향 선정", level=1)
+    _add_df_table(doc, pd.DataFrame([{
+        "허용치": fmt_kt(lim),
+        "최적 활주로": rwy_name(A['results'][lim]['best_angle']),
+        "방위각(°)": A['results'][lim]['best_angle'],
+        "이용률(%)": f"{A['results'][lim]['best_usab']:.3f}",
+        "판정": "적합" if A['results'][lim]['pass'] else "부적합",
+    } for lim in CROSSWIND_LIMITS_KT]))
+    doc.add_paragraph(
+        f"세 허용치를 종합한 결과, 최적 활주로 방향은 {rwy_name(r['best_angle'])} "
+        f"(방위각 {r['best_angle']}°)로 선정되었다. 적용 허용치 {fmt_kt(primary_limit)} 기준 "
+        f"단일 활주로 이용률은 {r['best_usab']:.3f}%이다."
+    )
+    if not r['pass']:
+        doc.add_paragraph(
+            f"단일 활주로로는 ICAO 권고 이용률 {USABILITY_TARGET:g}%에 미달하므로, "
+            f"2개 활주로 조합({rwy_name(r['pair_angles'][0])} + {rwy_name(r['pair_angles'][1])}) "
+            f"적용 시 이용률은 {r['pair_usab']:.3f}%로 개선된다."
+        )
+
+    # 6. 결론 및 의견 (생성 후 Word에서 작성)
+    doc.add_heading("6. 결론 및 의견", level=1)
+    doc.add_paragraph("[ 작성: 분석 결과에 대한 종합 의견 및 권고사항 ]")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 # 2. 메인페이지 설정 UI — 사이드바 대신 첫 화면에서 한 번에 설정 (박스 단위로 구획)
 st.markdown("### 분석 설정")
 
@@ -1190,3 +1502,37 @@ if run_clicked:
                 file_name=f"data_quality_{stn_name}_{_chart_start}_{_chart_end}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+            # ── 검토서(Word) 생성 ─────────────────────────────────────────
+            st.divider()
+            st.subheader("활주로 방향 검토서 생성")
+            st.caption(
+                "분석 결과를 ICAO 기준 검토서(.docx)로 내보냅니다. 풍배도·이용률 곡선·"
+                "빈도표·상세표가 자동 삽입되며, 개요·결론 등 서술 항목([ 작성 ] 표시)은 "
+                "생성 후 Word/HWP에서 직접 작성하면 됩니다."
+            )
+            if st.button("검토서 생성", type="primary", key="gen_review_docx"):
+                with st.spinner("검토서 작성 중 (차트 렌더링 포함)..."):
+                    st.session_state['review_docx'] = build_review_docx(
+                        A, df, stn_name, _chart_start, _chart_end, primary_limit,
+                        _n_raw, _n_valid, _n_invalid,
+                    )
+                    st.session_state['review_docx_name'] = (
+                        f"활주로방향검토서_{stn_name}_{_chart_start}_{_chart_end}.docx"
+                    )
+                st.success("검토서가 생성되었습니다. 아래 버튼으로 내려받으세요.")
+
+            if st.session_state.get('review_docx'):
+                st.download_button(
+                    "검토서 다운로드 (.docx)",
+                    st.session_state['review_docx'],
+                    file_name=st.session_state.get(
+                        'review_docx_name', '활주로방향검토서.docx'),
+                    mime=("application/vnd.openxmlformats-officedocument"
+                          ".wordprocessingml.document"),
+                    key="dl_review_docx",
+                )
+                st.caption(
+                    "HWP 사용 시: 한글에서 이 .docx 파일을 열어 내용을 보완한 뒤 "
+                    "'다른 이름으로 저장 → 한글 문서(.hwp)'로 저장하세요."
+                )
