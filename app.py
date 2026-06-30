@@ -272,7 +272,14 @@ def _fetch_one(session, key, stn, start_dt, end_dt):
             'endDt': end_dt, 'endHh': '23', 'stnIds': stn,
         }
         r = session.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
-        res = r.json()
+        if r.status_code != 200:
+            # data.go.kr 게이트웨이 오류(502 등) → 원인을 명확히 전달 (JSON 파싱 전에 차단)
+            raise RuntimeError(f"HTTP {r.status_code} · {r.text[:80].strip()}")
+        try:
+            res = r.json()
+        except ValueError:
+            # 키 오류·서비스 점검 시 JSON 대신 XML/평문 오류가 오므로 본문 앞부분을 노출
+            raise RuntimeError(f"비정상 응답(JSON 아님): {r.text[:120].strip()}")
         items = res.get('response', {}).get('body', {}).get('items', {}).get('item', [])
         if isinstance(items, dict):
             items = [items]
@@ -299,6 +306,7 @@ def get_weather_data_v28(key, stn, s_date, e_date):
     done = 0
     t0 = time.perf_counter()
 
+    failed = []
     with _make_session() as session, ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_one, session, key, stn, s, e): (s, e) for s, e in chunks}
         for fut in as_completed(futures):
@@ -308,7 +316,10 @@ def get_weather_data_v28(key, stn, s_date, e_date):
                 if items:
                     all_combined.extend(items)
             except Exception as ex:
-                return None, f"{s}~{e} 구간 수집 실패: {ex}"
+                # 개별 구간 실패는 전체 수집을 중단시키지 않고 누적해 두었다가 보고
+                # (일시적 네트워크 오류·API 혼잡 방어. 과거엔 첫 실패에서 즉시 return하며
+                #  반환값 개수가 달라 호출부 언패킹이 깨졌음 — 반드시 3-tuple 유지)
+                failed.append(f"{s}~{e}: {ex}")
             done += 1
             p_bar.progress(done / total)
             msg_slot.info(f"⏳ 수집 진행 {done}/{total}개월 · 경과 {time.perf_counter()-t0:.1f}s")
@@ -316,7 +327,10 @@ def get_weather_data_v28(key, stn, s_date, e_date):
     msg_slot.success(f"수집 완료 · {len(all_combined):,}행 · 총 {time.perf_counter()-t0:.1f}s")
 
     if not all_combined:
-        return None, None, "수집된 데이터가 없습니다. 날짜와 지점을 확인하세요."
+        reason = "수집된 데이터가 없습니다. 날짜·지점·API 키를 확인하세요."
+        if failed:
+            reason += f" (구간 실패 {len(failed)}/{total}건 · 예: {failed[0]})"
+        return None, None, reason
 
     df = pd.DataFrame(all_combined)
     df['wd']    = pd.to_numeric(df['wd'], errors='coerce')
