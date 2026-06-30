@@ -208,3 +208,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Claude Code 로컬 전용 (개인 권한 설정·worktree 내부 파일 — 공유 금지)
+.claude/settings.local.json
+.claude/worktrees/
+
+# 에디터 개인 설정
+.vscode/
+
+# 임시/로그
+streamlit.log
