@@ -804,6 +804,58 @@ def _clear_body(doc):
         body.remove(child)
 
 
+def _replace_in_paragraph(p, mapping):
+    """문단 내 {{KEY}} 자리표시를 mapping 값으로 치환.
+    자리표시가 여러 run으로 쪼개져 있어도 동작하도록 run 텍스트를 합쳐 처리하고,
+    결과를 첫 run에 넣어 그 run의 서식(글꼴·크기·색)을 유지한다."""
+    full = "".join(r.text for r in p.runs)
+    if "{{" not in full:
+        return
+    new = full
+    for k, v in mapping.items():
+        new = new.replace("{{" + k + "}}", str(v))
+    if new != full and p.runs:
+        p.runs[0].text = new
+        for r in p.runs[1:]:
+            r.text = ""
+
+
+def _iter_placeholder_targets(doc, include_header_footer=True):
+    """치환 대상 문단을 순회 (본문·표, 선택적으로 머리말/꼬리말)."""
+    for p in doc.paragraphs:
+        yield p
+    for t in doc.tables:
+        for row in t.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    yield p
+    if include_header_footer:
+        for section in doc.sections:
+            for hf in (section.header, section.footer):
+                for p in hf.paragraphs:
+                    yield p
+                for t in hf.tables:
+                    for row in t.rows:
+                        for cell in row.cells:
+                            for p in cell.paragraphs:
+                                yield p
+
+
+def _replace_placeholders(doc, mapping):
+    """문서 전체(본문·표·머리말/꼬리말)의 {{KEY}} 자리표시를 치환."""
+    for p in _iter_placeholder_targets(doc, include_header_footer=True):
+        _replace_in_paragraph(p, mapping)
+
+
+def _has_body_placeholder(doc):
+    """본문(또는 본문 표)에 {{...}} 자리표시가 있으면 True → 표지 페이지로 간주.
+    (머리말/꼬리말의 자리표시는 표지 판정에서 제외)"""
+    for p in _iter_placeholder_targets(doc, include_header_footer=False):
+        if "{{" in "".join(r.text for r in p.runs):
+            return True
+    return False
+
+
 def _add_toc(doc):
     """제목1/제목2 스타일 기반 자동 목차(TOC) 필드를 삽입한다.
     Word/HWP에서 문서를 열고 F9(또는 우클릭 → '필드 업데이트')로 페이지번호까지 갱신된다."""
@@ -878,25 +930,44 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     from docx.shared import Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    if os.path.exists(REPORT_TEMPLATE_PATH):
-        doc = Document(REPORT_TEMPLATE_PATH)   # 템플릿 스타일·페이지설정·머리말/꼬리말 상속
-        _clear_body(doc)                       # 본문 자리표시만 비우고 서식은 유지
-    else:
-        doc = Document()
-        _docx_set_korean_font(doc)             # 템플릿이 없을 때만 기본 한글 글꼴 적용
-
     period_months = ((chart_end.year - chart_start.year) * 12
                      + (chart_end.month - chart_start.month) + 1)
     r = A['results'][primary_limit]
 
-    title = doc.add_heading("활주로 방향 검토서", level=0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sub = doc.add_paragraph(
-        f"대상 관측소: {stn_name}    |    분석기간: "
-        f"{chart_start:%Y-%m-%d} ~ {chart_end:%Y-%m-%d}"
-    )
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph()
+    # 표지 자리표시 치환값. 템플릿 본문(표지)에 {{TITLE}} {{STATION}} {{PERIOD}}
+    # {{DATE}} {{DATE_KR}} 를 넣어두면 아래 값으로 자동 치환된다.
+    today = date.today()
+    _ph_map = {
+        "TITLE": "활주로 방향 검토서",
+        "STATION": stn_name,
+        "PERIOD": f"{chart_start:%Y-%m-%d} ~ {chart_end:%Y-%m-%d}",
+        "DATE": f"{today:%Y-%m-%d}",
+        "DATE_KR": f"{today.year}년 {today.month}월 {today.day}일",
+    }
+
+    has_cover = False
+    if os.path.exists(REPORT_TEMPLATE_PATH):
+        doc = Document(REPORT_TEMPLATE_PATH)   # 템플릿 스타일·페이지설정·머리말/꼬리말 상속
+        has_cover = _has_body_placeholder(doc)  # 본문에 {{...}}가 있으면 표지로 간주
+        if has_cover:
+            _replace_placeholders(doc, _ph_map)  # 표지 제목·날짜 등 치환
+            doc.add_page_break()                 # 표지 뒤 페이지 나눔
+        else:
+            _clear_body(doc)                     # 스타일만 있는 템플릿 → 본문 비우고 서식 상속
+    else:
+        doc = Document()
+        _docx_set_korean_font(doc)               # 템플릿이 없을 때만 기본 한글 글꼴 적용
+
+    # 표지가 없을 때만 코드가 표제/부제를 생성 (표지가 있으면 그 표지가 제목 역할)
+    if not has_cover:
+        title = doc.add_heading("활주로 방향 검토서", level=0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sub = doc.add_paragraph(
+            f"대상 관측소: {stn_name}    |    분석기간: "
+            f"{chart_start:%Y-%m-%d} ~ {chart_end:%Y-%m-%d}"
+        )
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph()
 
     # 목차 (제목1/제목2 스타일 기반 자동 목차 — Word/HWP에서 F9로 갱신)
     toc_title = doc.add_paragraph()
