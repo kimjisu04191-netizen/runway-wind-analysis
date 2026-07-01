@@ -126,6 +126,21 @@ fmt_kt(3.0) → "3 kt (1.5 m/s)"
 
 ---
 
+## 검토서(Word) 생성
+
+`build_review_docx()`가 분석 결과를 ICAO 기준 검토서(.docx)로 내보낸다. 차트는 배포 환경
+안정성을 위해 kaleido가 아닌 **matplotlib(Agg)** 로 렌더링한다.
+
+- **스타일 템플릿**: `assets/report_template.docx`가 있으면 그 문서의 글꼴·표 스타일·페이지
+  설정·머리말/꼬리말을 상속한다(없으면 기본 폴백). 스타일 변경은 **코드가 아니라 이 템플릿
+  파일만 편집**. 코드가 쓰는 스타일 이름: `Title` / `Heading 1` / `Heading 2` / `Normal` /
+  표 스타일 상수 `REPORT_TABLE_STYLE`(기본 `"Table Grid"`). 상세: `assets/report_template_guide.md`.
+- **목차**: `Heading 1/2` 기반 TOC 필드 삽입. Word/HWP에서 F9로 갱신.
+- **UI**: 결과 하단에서 분석과 같은 실행에 미리 생성해 `download_button`으로 제공한다.
+  별도 `st.button`을 쓰면 `if run_clicked:` 블록이 rerun에서 사라져 초기화면으로 돌아가므로 금지.
+
+---
+
 ## API 명세
 
 ### ASOS 시간 자료 (data.go.kr)

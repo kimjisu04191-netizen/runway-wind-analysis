@@ -1,4 +1,5 @@
 import io
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -784,6 +785,43 @@ def _build_summary_table(A):
     return pd.DataFrame(rows)
 
 
+# 검토서 템플릿: assets/report_template.docx 가 있으면 그 문서의 스타일(글꼴·표 스타일·
+# 페이지 설정·머리말/꼬리말)을 그대로 상속한다. 없으면 기본 문서로 폴백한다.
+# → 스타일을 바꾸려면 코드 수정 없이 이 템플릿 파일만 Word로 편집하면 된다.
+REPORT_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "report_template.docx")
+REPORT_TABLE_STYLE = "Table Grid"   # 템플릿에서 이 스타일을 재정의하거나 커스텀 표 스타일명으로 교체 가능
+
+
+def _clear_body(doc):
+    """템플릿 본문의 자리표시 콘텐츠(문단·표)만 제거. 스타일 정의, 페이지 설정(sectPr),
+    머리말/꼬리말(별도 파트)은 그대로 유지되어 생성 콘텐츠가 템플릿 서식을 상속한다."""
+    from docx.oxml.ns import qn
+    body = doc.element.body
+    for child in list(body):
+        if child.tag == qn('w:sectPr'):     # 섹션(페이지) 설정은 보존
+            continue
+        body.remove(child)
+
+
+def _add_toc(doc):
+    """제목1/제목2 스타일 기반 자동 목차(TOC) 필드를 삽입한다.
+    Word/HWP에서 문서를 열고 F9(또는 우클릭 → '필드 업데이트')로 페이지번호까지 갱신된다."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    run = doc.add_paragraph().add_run()
+    f_begin = OxmlElement('w:fldChar'); f_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve')
+    instr.text = 'TOC \\o "1-2" \\h \\z \\u'
+    f_sep = OxmlElement('w:fldChar'); f_sep.set(qn('w:fldCharType'), 'separate')
+    placeholder = OxmlElement('w:t')
+    placeholder.text = "목차: 우클릭 → '필드 업데이트'(F9)로 생성됩니다."
+    f_end = OxmlElement('w:fldChar'); f_end.set(qn('w:fldCharType'), 'end')
+    r = run._r
+    for _el in (f_begin, instr, f_sep, placeholder, f_end):
+        r.append(_el)
+
+
 def _docx_set_korean_font(doc, name="맑은 고딕", size=10):
     from docx.shared import Pt
     from docx.oxml.ns import qn
@@ -809,7 +847,10 @@ def _add_df_table(doc, df, header_bg="D9E1F2", font_size=10):
     from docx.shared import Pt
     cols = list(df.columns)
     t = doc.add_table(rows=1, cols=len(cols))
-    t.style = "Table Grid"
+    try:
+        t.style = REPORT_TABLE_STYLE        # 템플릿이 제공/재정의한 표 스타일 우선
+    except KeyError:
+        t.style = "Table Grid"              # 템플릿에 해당 스타일이 없으면 기본
     t.autofit = True
     hdr = t.rows[0].cells
     for j, c in enumerate(cols):
@@ -837,8 +878,12 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     from docx.shared import Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    doc = Document()
-    _docx_set_korean_font(doc)
+    if os.path.exists(REPORT_TEMPLATE_PATH):
+        doc = Document(REPORT_TEMPLATE_PATH)   # 템플릿 스타일·페이지설정·머리말/꼬리말 상속
+        _clear_body(doc)                       # 본문 자리표시만 비우고 서식은 유지
+    else:
+        doc = Document()
+        _docx_set_korean_font(doc)             # 템플릿이 없을 때만 기본 한글 글꼴 적용
 
     period_months = ((chart_end.year - chart_start.year) * 12
                      + (chart_end.month - chart_start.month) + 1)
@@ -852,6 +897,14 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     )
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
+
+    # 목차 (제목1/제목2 스타일 기반 자동 목차 — Word/HWP에서 F9로 갱신)
+    toc_title = doc.add_paragraph()
+    _toc_run = toc_title.add_run("목  차")
+    _toc_run.bold = True
+    toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_toc(doc)
+    doc.add_page_break()
 
     # 1. 검토 개요 (서술 항목은 생성 후 Word에서 직접 편집)
     doc.add_heading("1. 검토 개요", level=1)
