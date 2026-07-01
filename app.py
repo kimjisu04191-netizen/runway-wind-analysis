@@ -1518,6 +1518,10 @@ if run_clicked:
             )
 
             # ── 검토서(Word) 생성 ─────────────────────────────────────────
+            # 분석과 같은 실행에서 미리 생성해 download_button으로 직접 제공한다.
+            # (별도 st.button은 클릭 시 rerun을 일으키는데, 결과 표시가 `if run_clicked`
+            #  블록 안에 있어 rerun 시 run_clicked=False가 되며 화면 전체가 초기화되어
+            #  아무 동작도 하지 않는 문제가 있었음. Excel 다운로드와 동일한 패턴으로 통일.)
             st.divider()
             st.subheader("활주로 방향 검토서 생성")
             st.caption(
@@ -1525,23 +1529,16 @@ if run_clicked:
                 "빈도표·상세표가 자동 삽입되며, 개요·결론 등 서술 항목([ 작성 ] 표시)은 "
                 "생성 후 Word/HWP에서 직접 작성하면 됩니다."
             )
-            if st.button("검토서 생성", type="primary", key="gen_review_docx"):
+            try:
                 with st.spinner("검토서 작성 중 (차트 렌더링 포함)..."):
-                    st.session_state['review_docx'] = build_review_docx(
+                    _review_docx = build_review_docx(
                         A, df, stn_name, _chart_start, _chart_end, primary_limit,
                         _n_raw, _n_valid, _n_invalid,
                     )
-                    st.session_state['review_docx_name'] = (
-                        f"활주로방향검토서_{stn_name}_{_chart_start}_{_chart_end}.docx"
-                    )
-                st.success("검토서가 생성되었습니다. 아래 버튼으로 내려받으세요.")
-
-            if st.session_state.get('review_docx'):
                 st.download_button(
                     "검토서 다운로드 (.docx)",
-                    st.session_state['review_docx'],
-                    file_name=st.session_state.get(
-                        'review_docx_name', '활주로방향검토서.docx'),
+                    _review_docx,
+                    file_name=f"활주로방향검토서_{stn_name}_{_chart_start}_{_chart_end}.docx",
                     mime=("application/vnd.openxmlformats-officedocument"
                           ".wordprocessingml.document"),
                     key="dl_review_docx",
@@ -1550,3 +1547,5 @@ if run_clicked:
                     "HWP 사용 시: 한글에서 이 .docx 파일을 열어 내용을 보완한 뒤 "
                     "'다른 이름으로 저장 → 한글 문서(.hwp)'로 저장하세요."
                 )
+            except Exception as _docx_err:
+                st.error(f"검토서 생성 중 오류가 발생했습니다: {_docx_err}")
