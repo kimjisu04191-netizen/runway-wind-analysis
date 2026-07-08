@@ -136,6 +136,12 @@ fmt_kt(3.0) → "3 kt (1.5 m/s)"
   파일만 편집**. 코드가 쓰는 스타일 이름: `Title` / `Heading 1` / `Heading 2` / `Normal` /
   표 스타일 상수 `REPORT_TABLE_STYLE`(기본 `"Table Grid"`). 상세: `assets/report_template_guide.md`.
 - **목차**: `Heading 1/2` 기반 TOC 필드 삽입. Word/HWP에서 F9로 갱신.
+- **본문 서술**: 각 장은 소절(`Heading 2` 1.1~6.3)과 서술 문단으로 구성. 서술은 **고정
+  문구(boilerplate) + 분석값 자동 치환** 방식으로 코드에 하드코딩되어 있어 **매 생성 시 LLM
+  토큰이 들지 않는다**. 파생 통계는 `_narr_stats()`가 A·df만으로 계산(주풍 방향·최소/최대
+  이용률·측풍 등). 문구 수정은 `build_review_docx()` 내부 f-string을 편집.
+- **[ 작성 ] 항목**: 사용자가 채워야 하는 자리표시는 빨강(FF0000). 표 셀은 `_add_df_table`가,
+  본문은 `_add_red_para()`가 처리.
 - **UI**: 결과 하단에서 분석과 같은 실행에 미리 생성해 `download_button`으로 제공한다.
   별도 `st.button`을 쓰면 `if run_clicked:` 블록이 rerun에서 사라져 초기화면으로 돌아가므로 금지.
 

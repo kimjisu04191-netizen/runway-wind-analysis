@@ -900,6 +900,7 @@ def _add_df_table(doc, df, header_bg="D9E1F2", center_data=False):
     (→ 표 내부 글꼴을 템플릿에서 일괄 제어). 헤더는 음영·굵게·가운데정렬,
     center_data=True면 데이터 셀도 가운데정렬(숫자·라벨 위주 표)."""
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import RGBColor
     cols = list(df.columns)
     t = doc.add_table(rows=1, cols=len(cols))
     try:
@@ -919,16 +920,116 @@ def _add_df_table(doc, df, header_bg="D9E1F2", center_data=False):
         cells = t.add_row().cells
         for j, c in enumerate(cols):
             v = rowdata[c]
-            cells[j].text = "" if pd.isna(v) else str(v)
-            if center_data:
-                for p in cells[j].paragraphs:
+            sval = "" if pd.isna(v) else str(v)
+            cells[j].text = sval
+            is_todo = "[ 작성" in sval          # 미작성 항목은 빨강 강조
+            for p in cells[j].paragraphs:
+                if center_data:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if is_todo:
+                    for run in p.runs:
+                        run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+                        run.font.bold = True
     return t
+
+
+# 영문 16방위 → 한글 방위명 (서술문 표기용)
+_KDIR = {
+    "N": "북", "NNE": "북북동", "NE": "북동", "ENE": "동북동", "E": "동", "ESE": "동남동",
+    "SE": "남동", "SSE": "남남동", "S": "남", "SSW": "남남서", "SW": "남서", "WSW": "서남서",
+    "W": "서", "WNW": "서북서", "NW": "북서", "NNW": "북북서",
+}
+
+
+def _narr_stats(A, df, stn_name, chart_start, chart_end, primary_limit,
+                n_raw, n_valid, n_invalid):
+    """검토서 본문 서술에 쓰는 파생 통계값을 계산해 dict로 반환.
+    (LLM 없이 분석결과 A와 원자료 df만으로 값을 산출 → 매 생성 시 토큰 비용 없음)"""
+    angles = A['angles']
+    period_months = ((chart_end.year - chart_start.year) * 12
+                     + (chart_end.month - chart_start.month) + 1)
+    py = period_months / 12
+    period_years_str = str(int(py)) if float(py).is_integer() else f"{py:.1f}"
+
+    ws_kt = df['ws_kt'].to_numpy(dtype=float)
+    calm_rose_pct = float((ws_kt <= 0.5 * 1.94384).mean() * 100) if len(ws_kt) else 0.0
+
+    ft = A['freq_table']
+    total_col = ft['TOTAL %']
+    top = total_col.sort_values(ascending=False)
+    top_dirs = [(d, _KDIR.get(d, d), float(top[d])) for d in top.index[:3]]
+
+    spd_cols = [c for c in ft.columns if c != 'TOTAL %']
+    noncalm = [c for c in spd_cols if not c.startswith('Calm')]
+    col_sums = {c: float(ft[c].sum()) for c in noncalm}
+    dom_bin = max(col_sums, key=col_sums.get) if col_sums else ''
+    dom_bin_short = dom_bin.split('(')[0].strip()
+    over20_pct = float(sum(ft[c].sum() for c in spd_cols if c.strip().startswith('>')))
+
+    best_angle = int(A['results'][primary_limit]['best_angle'])
+    best_idx = best_angle // RWY_ANGLE_STEP_DEG
+    best_rwy = rwy_name(best_angle)
+    opp_angle = (best_angle + 180) % 360
+
+    usab_by = {lim: float(A['results'][lim]['best_usab']) for lim in CROSSWIND_LIMITS_KT}
+    mean_xw_kt = float(A['results'][primary_limit]['mean_xwind'])
+    max_xw_kt = float(A['results'][primary_limit]['max_xwind'])
+
+    perlim = {}
+    for lim in CROSSWIND_LIMITS_KT:
+        u = np.asarray(A['results'][lim]['usability'], dtype=float)
+        imin, imax = int(u.argmin()), int(u.argmax())
+        perlim[lim] = {
+            'min_ang': int(angles[imin]), 'min_val': float(u[imin]), 'min_rwy': rwy_name(int(angles[imin])),
+            'max_ang': int(angles[imax]), 'max_val': float(u[imax]), 'max_rwy': rwy_name(int(angles[imax])),
+            'umin': float(u.min()), 'umax': float(u.max()),
+        }
+    all_pass = all(bool((np.asarray(A['results'][lim]['usability']) >= USABILITY_TARGET).all())
+                   for lim in CROSSWIND_LIMITS_KT)
+    same_dir = len({A['results'][lim]['best_angle'] for lim in CROSSWIND_LIMITS_KT}) == 1
+    overall_min = min(perlim[lim]['umin'] for lim in CROSSWIND_LIMITS_KT)
+    overall_max = max(perlim[lim]['umax'] for lim in CROSSWIND_LIMITS_KT)
+
+    return {
+        'period_months': period_months, 'period_years_str': period_years_str,
+        'valid_pct': n_valid / n_raw * 100 if n_raw else 0.0,
+        'miss_pct': n_invalid / n_raw * 100 if n_raw else 0.0,
+        'calm_rose_pct': calm_rose_pct,
+        'top_dirs': top_dirs, 'dom_bin_short': dom_bin_short, 'over20_pct': over20_pct,
+        'best_angle': best_angle, 'best_idx': best_idx, 'best_rwy': best_rwy, 'opp_angle': opp_angle,
+        'usab_by': usab_by, 'mean_xw_kt': mean_xw_kt, 'max_xw_kt': max_xw_kt,
+        'perlim': perlim, 'all_pass': all_pass, 'same_dir': same_dir,
+        'overall_min': overall_min, 'overall_max': overall_max,
+    }
+
+
+def _add_red_para(doc, text):
+    """[ 작성 ] 등 미작성 항목을 빨강·굵게로 삽입."""
+    from docx.shared import RGBColor
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+    run.font.bold = True
+    return p
+
+
+def _add_bullet(doc, text, indent=True):
+    """불릿 문단(스타일 의존 없이 문자 불릿으로)."""
+    p = doc.add_paragraph(("    · " if indent else "· ") + text)
+    return p
+
+
+def _add_caption(doc, text):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    c = doc.add_paragraph(text)
+    c.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    return c
 
 
 def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
                       n_raw, n_valid, n_invalid):
-    """분석 결과(A)와 원자료(df)로 활주로 방향 검토서(.docx) bytes 생성."""
+    """분석 결과(A)와 원자료(df)로 활주로 방향 검토서(.docx) bytes 생성.
+    본문 서술은 고정 문구(boilerplate) + 분석값 자동 치환 방식(LLM 미사용)."""
     from docx import Document
     from docx.shared import Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -980,7 +1081,14 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     _add_toc(doc)
     doc.add_page_break()
 
-    # 1. 검토 개요 (서술 항목은 생성 후 Word에서 직접 편집)
+    # 본문 서술용 파생 통계 (분석결과 값 자동 치환)
+    S = _narr_stats(A, df, stn_name, chart_start, chart_end, primary_limit,
+                    n_raw, n_valid, n_invalid)
+    start_kr = f"{chart_start.year}년 {chart_start.month}월 {chart_start.day}일"
+    end_kr = f"{chart_end.year}년 {chart_end.month}월 {chart_end.day}일"
+    calm_lbl = fmt_kt(CALM_THRESHOLD_KT)
+
+    # 1. 검토 개요
     doc.add_heading("1. 검토 개요", level=1)
     _add_df_table(doc, pd.DataFrame([
         {"항목": "공항(시설)명", "내용": "[ 작성 ]"},
@@ -993,27 +1101,104 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     ]))
     doc.add_paragraph()
 
+    doc.add_heading("1.1 검토배경 및 목적", level=2)
+    _add_red_para(doc, "[ 작성: 본 검토의 배경이 되는 사업명 및 구체적 검토 목적을 기재 ]")
+    doc.add_paragraph(
+        "활주로 방향은 항공기 이착륙 시 안전성 및 운영효율성을 결정짓는 핵심 요소로서, "
+        "특정 방향 활주로에 대한 풍향·풍속 분석에 기반한 활주로 이용률(Wind Coverage) 검증이 "
+        "선행되어야 한다. 이에 본 검토에서는 대상 관측소의 장기간 기상관측자료를 활용하여 "
+        "측풍 허용치별 활주로 이용률을 정량적으로 산정하고, 최적의 활주로 방향을 도출하고자 한다."
+    )
+
+    doc.add_heading("1.2 검토대상", level=2)
+    doc.add_paragraph(
+        f"본 검토의 대상 관측소는 {stn_name}(기상청 {stn_name} 관측소)로 하며, 해당 관측소에서 "
+        f"관측된 풍향·풍속 자료를 기초자료로 하여 분석을 수행한다."
+    )
+
+    doc.add_heading("1.3 분석기간", level=2)
+    doc.add_paragraph(
+        f"분석기간은 {start_kr}부터 {end_kr}까지 최근 {period_months}개월"
+        f"({S['period_years_str']}개년)간의 관측자료를 대상으로 한다. 다개년의 자료를 활용함으로써 "
+        f"계절별 풍향 변화 특성과 연도별 편차를 종합적으로 반영할 수 있도록 하였다."
+    )
+
+    doc.add_heading("1.4 검토기준", level=2)
+    doc.add_paragraph("본 검토는 활주로 방향 결정과 관련한 다음의 국내 및 국제 기준을 근거로 수행한다.")
+    doc.add_paragraph("○ 국내기준")
+    _add_bullet(doc, "공항시설법")
+    _add_bullet(doc, "공항·비행장시설 및 이착륙장 설치기준")
+    _add_bullet(doc, "공항·비행장시설 설계 세부지침")
+    doc.add_paragraph("○ 국제기준")
+    _add_bullet(doc, "ICAO Annex 14 (Aerodrome Design and Operations)")
+    _add_bullet(doc, "ICAO Doc.9157, Airport Design Manual Part 1 (Runways)")
+    doc.add_paragraph(
+        f"상기 기준에서 제시하는 활주로 이용률 기준(통상 {USABILITY_TARGET:g}% 이상)을 충족하는지 "
+        f"여부를 판단하는 것을 본 검토의 핵심 절차로 한다."
+    )
+    doc.add_paragraph()
+
     # 2. 기상자료 현황
     doc.add_heading("2. 기상자료 현황", level=1)
-    valid_pct = n_valid / n_raw * 100 if n_raw else 0
-    miss_pct = n_invalid / n_raw * 100 if n_raw else 0
     _add_df_table(doc, pd.DataFrame([
         {"구분": "전체 수집 행", "값": f"{n_raw:,} 행"},
-        {"구분": "유효 데이터 (풍향+풍속 존재)", "값": f"{n_valid:,} 행 ({valid_pct:.1f}%)"},
-        {"구분": "결측 데이터", "값": f"{n_invalid:,} 행 ({miss_pct:.1f}%)"},
+        {"구분": "유효 데이터 (풍향+풍속 존재)", "값": f"{n_valid:,} 행 ({S['valid_pct']:.1f}%)"},
+        {"구분": "결측 데이터", "값": f"{n_invalid:,} 행 ({S['miss_pct']:.1f}%)"},
         {"구분": "전체 관측시간", "값": f"{A['N_total']:,} 시간"},
-        {"구분": f"Calm (0~{fmt_kt(CALM_THRESHOLD_KT)})",
+        {"구분": f"Calm (0~{calm_lbl})",
          "값": f"{A['N_calm']:,} 시간 ({A['calm_pct']:.2f}%)"},
         {"구분": "유효 풍황 데이터", "값": f"{A['N_eff']:,} 시간"},
     ]))
     doc.add_paragraph()
 
+    doc.add_heading("2.1 자료 수집 현황", level=2)
+    doc.add_paragraph(
+        f"대상 관측소({stn_name})에서 분석기간({chart_start:%Y.%m.%d}~{chart_end:%Y.%m.%d}, "
+        f"{period_months}개월) 동안 수집된 기상관측자료는 총 {n_raw:,}행이며, 이는 시간 단위 "
+        f"관측자료를 기준으로 한 것이다."
+    )
+
+    doc.add_heading("2.2 자료 정합성 검토", level=2)
+    doc.add_paragraph(
+        f"수집된 전체 {n_raw:,}행 중 풍향 및 풍속이 모두 존재하는 유효 데이터는 "
+        f"{n_valid:,}행({S['valid_pct']:.1f}%)으로 나타났으며, 결측 데이터는 "
+        f"{n_invalid:,}행({S['miss_pct']:.1f}%)으로, 분석에 활용 가능한 자료의 정합성 및 "
+        f"신뢰도는 높은 것으로 판단된다. 결측 자료는 분석 결과에 미치는 영향이 미미하므로 "
+        f"별도의 보정 없이 분석대상에서 제외하였다."
+    )
+
+    doc.add_heading("2.3 정온(Calm) 조건 처리", level=2)
+    doc.add_paragraph(
+        f"유효 데이터 {A['N_total']:,}시간 중 풍속이 {calm_lbl} 이하인 Calm(무풍) 상태는 "
+        f"{A['N_calm']:,}시간(전체의 {A['calm_pct']:.2f}%)으로 집계되었다. Calm 조건은 풍속이 "
+        f"미약하여 특정 방향의 활주로 운영에 대한 측풍(Crosswind) 영향이 거의 없는 것으로 "
+        f"간주되며, ICAO Doc.9157 등 국제기준에 따라 방향별 활주로 이용률(Wind Coverage) "
+        f"산정 시 모든 활주로 방향에 대해 공통적으로 가산되는 항목으로 처리된다."
+    )
+
+    doc.add_heading("2.4 유효 풍향자료 산정", level=2)
+    doc.add_paragraph(
+        f"전체 관측시간 {A['N_total']:,}시간에서 Calm 시간 {A['N_calm']:,}시간을 제외한 "
+        f"유효 풍향 데이터는 {A['N_eff']:,}시간으로 산정되었으며, 본 자료를 기초로 방향별 "
+        f"측풍성분 및 활주로 이용률을 분석하는 데 활용하였다."
+    )
+    doc.add_paragraph()
+
     # 3. 분석 방법
     doc.add_heading("3. 분석 방법", level=1)
+
+    doc.add_heading("3.1 분석기준 및 근거", level=2)
     doc.add_paragraph(
-        "본 검토는 국제민간항공기구(ICAO) Annex 14 및 Doc.9157 Airport Design Manual에 따라 "
-        "활주로 방향별 측풍 이용률(usability factor)을 산정하였다. 측풍 허용치는 항공기 "
-        "기준활주로길이에 따라 다음과 같이 적용한다."
+        "본 검토는 국제민간항공기구(ICAO) Annex 14 및 Doc.9157 Airport Design Manual "
+        "Part 1(Runways)에 따라 활주로 방향별 측풍 이용률(Usability Factor)을 산정하였다. "
+        "이는 특정 활주로 방향에 대해 항공기가 안전하게 이착륙할 수 있는 시간의 비율을 정량적으로 "
+        "평가하기 위한 국제표준 분석기법이다."
+    )
+
+    doc.add_heading("3.2 측풍 허용치 적용기준", level=2)
+    doc.add_paragraph(
+        "측풍(Crosswind) 허용치는 대상공항의 항공기 기준활주로길이(ARFL)에 따라 아래와 같이 "
+        "차등 적용하였다."
     )
     _add_df_table(doc, pd.DataFrame([
         {"측풍 허용치": "20 kt (10.3 m/s)", "적용 대상": "기준활주로길이 1,500m 이상"},
@@ -1021,38 +1206,101 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
         {"측풍 허용치": "10 kt (5.1 m/s)", "적용 대상": "1,200m 미만"},
     ]))
     doc.add_paragraph(
-        f"풍속 {fmt_kt(CALM_THRESHOLD_KT)} 이하의 무풍(Calm) 상태는 활주로 방향과 무관하게 "
-        "이용 가능한 것으로 집계하였다. 이용률은 다음 식으로 산정한다."
+        "세 가지 허용치를 각각 적용하여 방향별 이용률을 산정함으로써, 활주로 규모 조건 변화에 "
+        "따른 최적 방향의 민감도를 함께 검토할 수 있도록 하였다."
     )
+
+    doc.add_heading("3.3 무풍(Calm) 상태의 처리", level=2)
+    doc.add_paragraph(
+        f"풍속 {calm_lbl} 이하의 무풍(Calm) 상태는 측풍 성분이 사실상 발생하지 않는 것으로 "
+        f"간주하여, 활주로 방향과 관계없이 모든 방향에 대해 공통적으로 이용 가능한 시간으로 "
+        f"집계하였다."
+    )
+
+    doc.add_heading("3.4 이용률 산정식", level=2)
+    doc.add_paragraph("방향별 이용률은 다음 식에 따라 산정하였다.")
     eq = doc.add_paragraph(
         "이용률(%) = (Calm 관측수 + 측풍성분 ≤ 허용치 관측수) ÷ 전체 관측수 × 100"
     )
     eq.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("3.5 분석 격자 및 방향 설정", level=2)
     doc.add_paragraph(
-        "활주로 명칭은 10° 단위로만 부여되므로 분석 격자도 10° 간격(0°~170°, 18방향)으로 고정하였다. "
-        "최적 활주로 방향은 세 허용치(10·13·20kt)의 이용률을 모두 합산한 결합 기준으로 "
-        "단일 방향을 공동 선정하였다."
+        "활주로 명칭은 자기방위 기준 10° 단위로만 부여되는 점을 고려하여, 분석 격자 또한 "
+        "10° 간격(0°~170°, 총 18방향)으로 고정하여 검토를 수행하였다. 이를 통해 산정된 최적 "
+        "방향이 실제 활주로 명칭 부여체계와 정합성을 갖도록 하였다."
+    )
+
+    doc.add_heading("3.6 최적 활주로 방향 선정기준", level=2)
+    doc.add_paragraph(
+        "최적 활주로 방향은 앞서 제시한 3가지 측풍 허용치(10kt·13kt·20kt) 각각에 대한 "
+        "이용률을 모두 합산한 결합 기준(Combined Criteria)에 따라, 세 조건에서 공통적으로 "
+        "우수한 성능을 보이는 단일 방향을 선정하는 방식으로 도출하였다."
     )
     doc.add_paragraph()
 
     # 4. 분석 결과
     doc.add_heading("4. 분석 결과", level=1)
+    td = S['top_dirs']
+    p10, p13, p20 = S['perlim'][10], S['perlim'][13], S['perlim'][20]
 
     doc.add_heading("4.1 풍배도 (Wind Rose)", level=2)
     rose_png = _render_windrose_png(
         df['wd'].to_numpy(dtype=float), df['ws_kt'].to_numpy(dtype=float))
     doc.add_picture(io.BytesIO(rose_png), width=Cm(11.5))
     doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    cap = doc.add_paragraph("그림 1. 16방위 풍배도 (중앙 원: 0.5 m/s 이하 정온 비율)")
-    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_caption(doc, "그림 1. 16방위 풍배도 (중앙 원: 0.5 m/s 이하 정온 비율)")
+    doc.add_paragraph(
+        f"풍배도 분석 결과, 대상 관측소의 주풍은 {td[0][1]}({td[0][0]}) 방향을 중심으로 분포하며, "
+        f"{td[0][1]} 방향이 전체 관측시간의 {td[0][2]:.2f}%를 차지하여 가장 높은 빈도를 보였다. "
+        f"이어 {td[1][1]}({td[1][0]}, {td[1][2]:.2f}%), {td[2][1]}({td[2][0]}, {td[2][2]:.2f}%) "
+        f"방향에서도 상대적으로 높은 빈도가 관측되었다. 이러한 주풍 분포는 후술하는 최적 활주로 "
+        f"방향 산정 결과와 연계하여 해석된다."
+    )
+    doc.add_paragraph(
+        f"한편 풍배도 중앙에 표기된 정온(Calm) 비율 {S['calm_rose_pct']:.1f}%는 풍속 0.5m/s "
+        f"이하를 기준으로 산정된 값으로, 활주로 이용률 산정에 적용한 정온 기준"
+        f"({calm_lbl} 이하, {A['calm_pct']:.2f}%)과는 임계풍속 기준이 상이하므로 상호 혼동하지 "
+        f"않도록 유의할 필요가 있다. 이용률 분석에는 2·3장에서 정의한 {calm_lbl} 기준의 정온 "
+        f"자료가 일관되게 적용되었다."
+    )
 
     doc.add_heading("4.2 방향별 이용률 곡선", level=2)
     doc.add_picture(io.BytesIO(_render_usability_png(A)), width=Cm(14.5))
     doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    cap2 = doc.add_paragraph("그림 2. 활주로 방위각별 측풍 이용률 (허용치별 비교)")
-    cap2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_caption(doc, "그림 2. 활주로 방위각별 측풍 이용률 (허용치별 비교)")
+    doc.add_paragraph(
+        f"방위각별 이용률 곡선을 살펴보면, 측풍 허용치 20kt(10.3m/s) 기준은 전 방위(0°~170°)에서 "
+        f"최소 {p20['umin']:.2f}%~최대 {p20['umax']:.2f}%의 이용률을 나타내어 방향에 관계없이 "
+        f"ICAO 기준({USABILITY_TARGET:g}%)을 상회하는 것으로 분석되었다. 13kt(6.7m/s) 기준 또한 "
+        f"최솟값({p13['min_ang']}°, {p13['min_val']:.2f}%)에서 최댓값({p13['max_ang']}°, "
+        f"{p13['max_val']:.2f}%)까지 좁은 변동폭을 보였다."
+    )
+    if p10['umin'] >= USABILITY_TARGET:
+        _t42 = (f"가장 낮은 구간({p10['min_val']:.2f}%)에서도 ICAO 최소기준인 {USABILITY_TARGET:g}%를 "
+                f"상회하고 있어, 본 대상지는 활주로 방향 설정에 있어 비교적 여유 있는 기상조건을 "
+                f"갖춘 것으로 판단된다.")
+    else:
+        _t42 = (f"가장 낮은 구간({p10['min_val']:.2f}%)은 ICAO 최소기준({USABILITY_TARGET:g}%)에 "
+                f"미달하므로, 해당 방위 활주로의 단독 운영 시 유의가 필요하다.")
+    doc.add_paragraph(
+        f"10kt(5.1m/s) 기준에서는 방위각에 따른 변동폭이 상대적으로 뚜렷하게 나타났다. "
+        f"방위각 {p10['min_ang']}° 부근에서 {p10['min_val']:.2f}%로 가장 낮은 이용률을, "
+        f"방위각 {p10['max_ang']}° 부근에서 {p10['max_val']:.2f}%로 최댓값을 기록하였다. " + _t42
+    )
 
     doc.add_heading("4.3 16방위 풍향·풍속 빈도표 (%)", level=2)
+    if S['over20_pct'] < 0.5:
+        _t43 = (f"20kt(10.3m/s)를 초과하는 강풍은 전 방위에서 {S['over20_pct']:.1f}%로 거의 관측되지 "
+                f"않아, 본 대상지는 강풍에 의한 활주로 운영제약 가능성이 낮은 것으로 판단된다.")
+    else:
+        _t43 = f"20kt(10.3m/s)를 초과하는 강풍은 전 방위 합계 {S['over20_pct']:.1f}%로 관측되었다."
+    doc.add_paragraph(
+        f"16방위 빈도분석 결과, {td[0][1]}({td[0][2]:.2f}%)와 {td[1][1]}({td[1][2]:.2f}%)가 "
+        f"전체 관측시간의 약 {td[0][2] + td[1][2]:.0f}%를 차지하며 뚜렷한 주풍 방향을 형성하는 "
+        f"것으로 나타났다. 풍속대별로는 대부분의 방위에서 {S['dom_bin_short']} 구간의 빈도가 가장 "
+        f"높게 나타났으며, " + _t43
+    )
     ft = A['freq_table'].reset_index().rename(columns={'index': '방위'})
     _add_df_table(doc, ft, center_data=True)
 
@@ -1062,9 +1310,39 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
         f"※ 측풍 허용치: 10kt=5.1m/s, 13kt=6.7m/s, 20kt=10.3m/s · "
         f"{USABILITY_TARGET:g}% 이상 적합 / 미만 부적합"
     )
+    if S['all_pass']:
+        _t44 = (f"방위각별 상세 분석 결과, 18개 전 방향에서 3개 허용치 기준 모두 ICAO 최소요건인 "
+                f"{USABILITY_TARGET:g}%를 만족하는 것으로 나타나, 본 대상지는 활주로 방향 선정에 "
+                f"있어 특정 방향으로 제약받지 않는 양호한 기상조건을 갖춘 것으로 판단된다. ")
+    else:
+        _t44 = (f"방위각별 상세 분석 결과, 일부 방위·허용치 조건에서 ICAO 최소요건"
+                f"({USABILITY_TARGET:g}%)에 미달하는 구간이 확인되었다. ")
+    doc.add_paragraph(
+        _t44 + f"방향별 편차는 10kt 기준에서 가장 뚜렷하게 나타났으며, {p10['max_rwy']} 활주로"
+        f"(방위각 {p10['max_ang']}°/{(p10['max_ang'] + 180) % 360}°)에서 {p10['max_val']:.2f}%로 "
+        f"전 방향 중 최댓값을, {p10['min_rwy']} 활주로(방위각 {p10['min_ang']}°/"
+        f"{(p10['min_ang'] + 180) % 360}°)에서 {p10['min_val']:.2f}%로 최솟값을 기록하였다."
+    )
 
     doc.add_heading("4.5 측풍 허용치별 종합", level=2)
     _add_df_table(doc, _build_summary_table(A), center_data=True)
+    if S['same_dir']:
+        _t45 = (f"측풍 허용치 10kt, 13kt, 20kt 3개 기준 전체에서 최적 활주로 방향이 방위각 "
+                f"{S['best_angle']}°/{S['opp_angle']}°, 즉 {S['best_rwy']} 활주로로 일관되게 "
+                f"도출되었다. 이는 항공기 기준활주로길이 조건이 달라지더라도 동일한 방향이 최적으로 "
+                f"선정됨을 의미하며, 산정된 방향의 강건성(Robustness)을 뒷받침하는 결과로 평가된다.")
+    else:
+        _t45 = (f"측풍 허용치별 최적 방향을 종합한 결과, 결합 기준상 {S['best_rwy']} 활주로"
+                f"(방위각 {S['best_angle']}°/{S['opp_angle']}°)가 최적 방향으로 산정되었다.")
+    doc.add_paragraph(_t45)
+    doc.add_paragraph(
+        f"{S['best_rwy']} 활주로 방향의 이용률은 {S['overall_min']:.3f}%~{S['overall_max']:.3f}%로 "
+        f"ICAO 기준({USABILITY_TARGET:g}%)을 상회하며, 최적 방향 기준 평균측풍은 "
+        f"{fmt_kt(round(S['mean_xw_kt'], 2))}, 분석기간 중 최대측풍은 "
+        f"{fmt_kt(round(S['max_xw_kt'], 2))}로 나타나 허용치 기준 대비 여유를 확보한 것으로 "
+        f"확인되었다. 이상을 종합할 때 본 대상지의 최적 활주로 방향은 {S['best_rwy']}"
+        f"(방위각 {S['best_angle']}°/{S['opp_angle']}°)로 판단된다."
+    )
 
     # 5. 최적 활주로 방향 선정
     doc.add_heading("5. 최적 활주로 방향 선정", level=1)
@@ -1076,8 +1354,8 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
         "판정": "적합" if A['results'][lim]['pass'] else "부적합",
     } for lim in CROSSWIND_LIMITS_KT]), center_data=True)
     doc.add_paragraph(
-        f"세 허용치를 종합한 결과, 최적 활주로 방향은 {rwy_name(r['best_angle'])} "
-        f"(방위각 {r['best_angle']}°)로 선정되었다. 적용 허용치 {fmt_kt(primary_limit)} 기준 "
+        f"세 허용치를 종합한 결과, 최적 활주로 방향은 {S['best_rwy']} "
+        f"(방위각 {S['best_angle']}°)로 선정되었다. 적용 허용치 {fmt_kt(primary_limit)} 기준 "
         f"단일 활주로 이용률은 {r['best_usab']:.3f}%이다."
     )
     if not r['pass']:
@@ -1087,9 +1365,115 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
             f"적용 시 이용률은 {r['pair_usab']:.3f}%로 개선된다."
         )
 
-    # 6. 결론 및 의견 (생성 후 Word에서 작성)
+    min_usab = min(S['usab_by'].values())
+
+    doc.add_heading("5.1 종합 판정", level=2)
+    if S['same_dir']:
+        _t51 = (f"4장에서 산정한 10kt, 13kt, 20kt 3개 측풍 허용치 기준 결과를 종합한 결과, 모든 "
+                f"허용치 조건에서 동일하게 방위각 {S['best_angle']}°(활주로 {S['best_rwy']})가 최적 "
+                f"방향으로 도출되었다. 이는 항공기 기준활주로길이 조건이 달라지더라도 최적 방향이 "
+                f"변동되지 않음을 의미하며, 특정 항공기 규모나 향후 활주로 연장 계획 변경 시에도 본 "
+                f"방향 선정 결과의 유효성이 유지될 수 있음을 시사한다.")
+    else:
+        _t51 = (f"3개 측풍 허용치 기준 결과를 종합한 결과, 결합 기준상 최적 방향은 방위각 "
+                f"{S['best_angle']}°(활주로 {S['best_rwy']})로 도출되었다.")
+    doc.add_paragraph(_t51)
+
+    doc.add_heading("5.2 이용률 검토", level=2)
+    if min_usab >= USABILITY_TARGET:
+        _t52 = (f"3개 허용치 모두 ICAO 및 국내기준에서 요구하는 최소 이용률 {USABILITY_TARGET:g}%를 "
+                f"상회하여 전 조건에서 적합 판정을 획득하였다. 특히 가장 보수적인 기준인 10kt "
+                f"허용치에서도 {USABILITY_TARGET:g}% 기준 대비 약 "
+                f"{S['usab_by'][10] - USABILITY_TARGET:.1f}%p의 여유를 확보하고 있어, 본 대상지는 "
+                f"활주로 방향 설계에 있어 기상학적 제약이 거의 없는 조건을 갖춘 것으로 판단된다.")
+    else:
+        _t52 = (f"가장 보수적인 10kt 허용치 기준 이용률({S['usab_by'][10]:.3f}%)이 최소기준"
+                f"({USABILITY_TARGET:g}%)에 대한 적합 여부를 별도로 검토할 필요가 있다.")
+    doc.add_paragraph(
+        f"{S['best_rwy']} 활주로의 허용치별 이용률은 10kt 기준 {S['usab_by'][10]:.3f}%, "
+        f"13kt 기준 {S['usab_by'][13]:.3f}%, 20kt 기준 {S['usab_by'][20]:.3f}%로 산정되었으며, " + _t52
+    )
+
+    doc.add_heading("5.3 최종 선정", level=2)
+    _t53end = "모두 충족하는 방향으로 확인되었다." if r['pass'] else "고려한 방향으로 산정되었다."
+    doc.add_paragraph(
+        f"이상의 분석 결과를 종합할 때, 대상지의 최적 활주로 방향은 {S['best_rwy']}"
+        f"(자기방위각 {S['best_angle']}°/{S['opp_angle']}°)로 최종 선정하며, 이는 단일 활주로 "
+        f"운영 시에도 국제 및 국내 기준을 " + _t53end
+    )
+    doc.add_paragraph()
+
+    # 6. 결론 및 의견
     doc.add_heading("6. 결론 및 의견", level=1)
-    doc.add_paragraph("[ 작성: 분석 결과에 대한 종합 의견 및 권고사항 ]")
+
+    doc.add_heading("6.1 검토결과 요약", level=2)
+    doc.add_paragraph(
+        f"본 검토는 {stn_name} 관측소의 최근 {period_months}개월"
+        f"({chart_start:%Y.%m.%d}~{chart_end:%Y.%m.%d})간 기상관측자료를 기초로 ICAO Annex 14 및 "
+        f"Doc.9157, 그리고 국내 공항시설법 등 관계기준에 따라 활주로 방향별 측풍 이용률을 "
+        f"산정하고 최적 활주로 방향을 도출하였다. 주요 검토결과를 종합하면 다음과 같다."
+    )
+    _verdict = "전 허용치 적합" if min_usab >= USABILITY_TARGET else "일부 조건 검토 필요"
+    _add_df_table(doc, pd.DataFrame([
+        {"구분": "대상 관측소", "주요 결과": stn_name},
+        {"구분": "분석기간",
+         "주요 결과": f"{chart_start:%Y.%m.%d}~{chart_end:%Y.%m.%d} ({period_months}개월)"},
+        {"구분": "유효 관측시간", "주요 결과": f"{A['N_eff']:,} 시간 (Calm {A['calm_pct']:.1f}% 제외)"},
+        {"구분": "최적 활주로 방향",
+         "주요 결과": f"{S['best_rwy']} (방위각 {S['best_angle']}°/{S['opp_angle']}°)"},
+        {"구분": "이용률 (10/13/20kt)",
+         "주요 결과": f"{S['usab_by'][10]:.3f}% / {S['usab_by'][13]:.3f}% / {S['usab_by'][20]:.3f}%"},
+        {"구분": "판정", "주요 결과": _verdict},
+    ]))
+
+    doc.add_heading("6.2 결론", level=2)
+    _c62a = ("본 방향은 측풍 허용치 조건(항공기 기준활주로길이)의 변화와 무관하게 모든 시나리오에서 "
+             "최적 방향으로 일관되게 도출되어 결과의 신뢰성과 강건성이 높은 것으로 평가되며, "
+             if S['same_dir'] else "")
+    if S['all_pass']:
+        _c62b = (f"ICAO 기준({USABILITY_TARGET:g}%) 대비 여유(최소 {S['overall_min']:.2f}%~최대 "
+                 f"{S['overall_max']:.2f}%)를 확보하고 있어 기상학적 관점에서 활주로 방향 설정에 "
+                 f"제약이 적은 것으로 판단된다.")
+    else:
+        _c62b = (f"방향별 이용률은 {S['overall_min']:.2f}%~{S['overall_max']:.2f}% 범위로, ICAO 기준"
+                 f"({USABILITY_TARGET:g}%)에 대해 일부 방위의 충족 여부에 대한 추가 검토가 필요한 "
+                 f"것으로 판단된다.")
+    doc.add_paragraph(
+        f"이상의 분석 결과, 대상지의 최적 활주로 방향은 {S['best_rwy']}"
+        f"(자기방위각 {S['best_angle']}°/{S['opp_angle']}°)로 최종 판단된다. " + _c62a + _c62b
+    )
+
+    doc.add_heading("6.3 의견", level=2)
+    doc.add_paragraph(
+        "본 검토는 풍향·풍속 자료에 기초한 활주로 이용률만을 대상으로 한 것으로, 활주로 방향의 "
+        "최종 확정을 위해서는 다음 사항에 대한 후속 검토가 병행될 필요가 있다."
+    )
+    doc.add_paragraph("1) 타 입지요소와의 종합 검토")
+    doc.add_paragraph(
+        "활주로 방향은 기상조건 외에도 장애물제한표면(Obstacle Limitation Surface), 주변 지형·"
+        "지장물, 공역 및 인접 공항과의 관제간섭, 소음영향권, 토지이용 등을 종합적으로 고려하여 "
+        "최종 확정되어야 한다. 본 검토에서 도출된 방향은 기상학적 최적안으로서, 타 요소 검토 "
+        "결과와의 정합성 확인이 필요하다."
+    )
+    doc.add_paragraph("2) 관측자료의 대표성 검증")
+    doc.add_paragraph(
+        f"본 분석에 활용된 {S['period_years_str']}개년({period_months}개월) 자료는 통상 요구되는 "
+        f"최소 관측기간(5년 이상)을 고려한 것이나, 대상 관측소와 실제 후보지 간 이격거리 및 "
+        f"지형적 차이에 따른 국지풍 영향 가능성을 배제할 수 없으므로, 필요시 후보지 인근 "
+        f"임시관측소(AWOS 등) 설치를 통한 현지 실측자료 보완을 권고한다."
+    )
+    doc.add_paragraph("3) 시설계획 단계에서의 재검증")
+    doc.add_paragraph(
+        "향후 기본계획 및 실시설계 단계에서 활주로 제원(길이·폭), 접근절차, 항공기 기종 구성 등이 "
+        "구체화될 경우, 해당 조건을 반영한 측풍 허용치 재적용 및 이용률 재검증을 실시할 것을 "
+        "권고한다."
+    )
+    doc.add_paragraph("4) 기후변화 등 장기 변동성 고려")
+    doc.add_paragraph(
+        "기상관측자료는 특정 시점의 최근 자료에 기초하므로, 향후 설계 확정 이전 기후변동성에 "
+        "따른 풍향·풍속 패턴 변화 가능성을 감안하여 최신 자료로 주기적으로 갱신·검증하는 것이 "
+        "바람직하다."
+    )
 
     buf = io.BytesIO()
     doc.save(buf)
