@@ -501,6 +501,21 @@ def _nearest_stations(lat, lon, station_df, stn_type, n=3):
     return sub.sort_values('dist_km').head(n).reset_index(drop=True)
 
 
+def _norm_stn_id(s):
+    """지점번호 표기 정규화(앞자리 0 차이 흡수). '090'/'90' → '90'."""
+    s = str(s).strip()
+    return str(int(s)) if s.isdigit() else s
+
+
+# ASOS 지점번호 → (광역시도, 관측소명, 관측시작일) 역참조 (주소검색 자동선택용)
+_ASOS_ID_TO_INFO = {
+    _norm_stn_id(sid): (rgn, nm, start)
+    for rgn, _stns in ASOS_BY_REGION.items()
+    for (sid, nm, start) in _stns
+}
+NEAR_ASOS_PREFER_KM = 5.0   # 방재가 더 가까워도 종관과 이 거리(km) 미만 차이면 종관 우선 선택
+
+
 # --- [ICAO/논문 기반 분석 함수] ---
 # 논문: 신동진, 김도현 (2009) "활주로 방향설정을 위한 풍배도 프로그램의 개발 연구"
 # 기준: ICAO Annex 14 / Doc. 9157 Airport Design Manual Part 1
@@ -1488,10 +1503,25 @@ row1_col1, row1_col2 = st.columns(2)
 with row1_col1:
     with st.container(border=True):
         st.markdown("**1. 관측소 선택**")
+
+        # 주소검색 자동선택 반영: 위젯 생성 '전에' pending 값을 위젯 key에 적용해야 한다
+        # (Streamlit은 위젯 생성 후 그 key의 session_state 수정을 금지하므로 pending 패턴 사용)
+        _pending = st.session_state.pop("pending_station", None)
+        if _pending:
+            st.session_state["obs_type_radio"] = _pending["obs_type"]
+            if _pending["obs_type"].startswith("ASOS"):
+                st.session_state["asos_region"] = _pending["region"]
+                st.session_state["asos_station_id"] = _pending["stn_id"]
+            else:
+                st.session_state["aws_stn_name"] = _pending["name"]
+        if "obs_type_radio" not in st.session_state:
+            st.session_state["obs_type_radio"] = "ASOS (종관)"
+
         obs_type = st.radio(
             "관측종류",
             ["ASOS (종관)", "AWS (방재) — CSV 업로드"],
             horizontal=True,
+            key="obs_type_radio",
             help=(
                 "ASOS: 기간(시작∼종료) 범위 조회 API 제공 → 5∼10년 장기분석 가능.\n"
                 "AWS: API는 단일 시점 조회만 지원되어 CSV 업로드 방식으로 분석합니다."
@@ -1505,25 +1535,30 @@ with row1_col1:
             region_db = ASOS_BY_REGION
             region_list = list(region_db.keys())
             default_region_idx = region_list.index("전남") if "전남" in region_list else 0
+            if "asos_region" not in st.session_state:
+                st.session_state["asos_region"] = region_list[default_region_idx]
 
             c_region, c_station = st.columns(2)
             with c_region:
-                region = st.selectbox("광역시도", region_list, index=default_region_idx)
+                region = st.selectbox("광역시도", region_list, key="asos_region")
 
-            # 해당 광역시도의 관측소 목록
+            # 해당 광역시도의 관측소 목록 (지점번호를 옵션값으로 사용 → 주소검색 자동선택과 정합)
             stations_in_region = region_db[region]
-            stn_labels = [f"{name} ({sid}) · {start}" for sid, name, start in stations_in_region]
+            region_ids = [s[0] for s in stations_in_region]
+            id_to_label = {sid: f"{name} ({sid}) · {start}" for sid, name, start in stations_in_region}
             default_name = "목포" if region == "전남" else stations_in_region[0][1]
-            default_idx = next((i for i, s in enumerate(stations_in_region) if s[1] == default_name), 0)
+            # 스테일 방지: 현재 지역에 없는 지점번호가 남아있으면 지역 기본값으로 초기화
+            if st.session_state.get("asos_station_id") not in region_ids:
+                st.session_state["asos_station_id"] = next(
+                    (sid for sid, name, start in stations_in_region if name == default_name),
+                    region_ids[0])
 
             with c_station:
-                selected_idx = st.selectbox("관측소", range(len(stn_labels)),
-                                            format_func=lambda i: stn_labels[i],
-                                            index=default_idx)
-            sel = stations_in_region[selected_idx]
-            stn_id = sel[0]
-            stn_name = sel[1]
-            stn_start = sel[2]
+                station_id = st.selectbox("관측소", region_ids,
+                                          format_func=lambda s: id_to_label[s],
+                                          key="asos_station_id")
+            sel = next(s for s in stations_in_region if s[0] == station_id)
+            stn_id, stn_name, stn_start = sel
             st.caption(f"[ASOS] {stn_name} ({region}) · 관측 가능일: {stn_start} ~ 현재")
         else:
             # AWS: API 대신 기상자료개방포털 CSV 업로드 방식
@@ -1544,7 +1579,9 @@ with row1_col1:
                     "4. 연도별로 나눠 받은 경우 여러 파일을 동시에 업로드 가능  \n"
                     "5. 컬럼에 **풍향(deg)** 과 **풍속(m/s)** 이 포함된 파일이어야 합니다."
                 )
-            stn_name = st.text_input("관측소 이름 (차트 표시용)", value="AWS 관측소")
+            if "aws_stn_name" not in st.session_state:
+                st.session_state["aws_stn_name"] = "AWS 관측소"
+            stn_name = st.text_input("관측소 이름 (차트 표시용)", key="aws_stn_name")
             aws_files = st.file_uploader(
                 "AWS 시간자료 CSV (복수 파일 동시 업로드 가능)",
                 type=["csv"],
@@ -1555,57 +1592,89 @@ with row1_col1:
                 st.caption(f"{len(aws_files)}개 파일 업로드됨")
 
         st.markdown("---")
-        st.markdown("**주소로 가까운 관측소 검색**")
+        st.markdown("**주소로 가까운 관측소 자동 선택**")
         st.caption(
-            "주소를 입력하면 종관(ASOS)·방재(AWS) 관측소 중 가장 가까운 3개소를 각각 찾아줍니다. "
+            "주소를 입력하면 가장 가까운 종관(ASOS) 관측소를 자동 선택합니다. 방재(AWS)가 종관보다 "
+            f"{NEAR_ASOS_PREFER_KM:g}km 이상 더 가까우면 방재 자료(CSV) 이용을 안내합니다. "
             "(기상청 API 허브 인증키·카카오 REST API 키는 상단 'API 키 설정'에서 입력)"
         )
         addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
 
-        if st.button("가까운 관측소 검색", key="btn_addr_search"):
+        if st.button("가까운 관측소 자동 선택", key="btn_addr_search"):
             _kma_hub_key = st.session_state.get("kma_hub_key", "")
             _kakao_key = st.session_state.get("kakao_key", "")
             if not _kma_hub_key or not _kakao_key:
-                st.error("'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요.")
+                st.session_state["addr_result"] = {"kind": "error",
+                    "msg": "'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요."}
             elif not addr_input:
-                st.error("주소를 입력하세요.")
+                st.session_state["addr_result"] = {"kind": "error", "msg": "주소를 입력하세요."}
             else:
                 with st.spinner("주소 검색 중..."):
                     lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
                 if err:
-                    st.error(f"주소 검색 실패: {err}")
+                    st.session_state["addr_result"] = {"kind": "error", "msg": f"주소 검색 실패: {err}"}
                 else:
-                    st.success(f"검색 위치: {disp_addr}  ({lat:.5f}, {lon:.5f})")
-                    with st.spinner("관측소 DB 로딩 중..."):
-                        try:
+                    try:
+                        with st.spinner("관측소 DB 로딩 중..."):
                             stn_db = _load_station_db(_kma_hub_key)
-                        except Exception as e:
-                            stn_db = None
-                            st.error(f"관측소 DB 로딩 실패: {e}")
+                    except Exception as e:
+                        stn_db = None
+                        st.session_state["addr_result"] = {"kind": "error", "msg": f"관측소 DB 로딩 실패: {e}"}
 
                     if stn_db is not None and len(stn_db) > 0:
-                        near_asos = _nearest_stations(lat, lon, stn_db, 'ASOS', n=3)
-                        near_aws  = _nearest_stations(lat, lon, stn_db, 'AWS', n=3)
+                        na = _nearest_stations(lat, lon, stn_db, 'ASOS', n=1)
+                        nw = _nearest_stations(lat, lon, stn_db, 'AWS', n=1)
+                        d_asos = float(na.iloc[0]['dist_km']) if len(na) else float('inf')
+                        d_aws = float(nw.iloc[0]['dist_km']) if len(nw) else float('inf')
+                        asos_id = str(na.iloc[0]['stn_id']) if len(na) else None
+                        asos_nm = na.iloc[0]['name_ko'] if len(na) else '—'
+                        aws_nm = nw.iloc[0]['name_ko'] if len(nw) else '—'
+                        info = _ASOS_ID_TO_INFO.get(_norm_stn_id(asos_id)) if asos_id else None
+                        pick_aws = (d_aws < d_asos) and ((d_asos - d_aws) >= NEAR_ASOS_PREFER_KM)
 
-                        _disp_cols = {'stn_id': '지점번호', 'name_ko': '관측소명',
-                                      'dist_km': '거리(km)', 'addr': '주소'}
+                        if pick_aws:
+                            st.session_state["pending_station"] = {
+                                "obs_type": "AWS (방재) — CSV 업로드", "name": aws_nm}
+                            st.session_state["addr_result"] = {"kind": "aws",
+                                "msg": (f"검색 위치: {disp_addr}\n\n"
+                                        f"가장 가까운 관측소는 방재(AWS) '{aws_nm}' ({d_aws:.1f}km)로, "
+                                        f"가장 가까운 종관(ASOS) '{asos_nm}' ({d_asos:.1f}km)보다 "
+                                        f"{d_asos - d_aws:.1f}km 더 가깝습니다. 방재 자료는 기간조회 API가 "
+                                        f"없어 CSV 업로드로 분석하므로, 관측종류를 방재(AWS)로 전환했습니다. "
+                                        f"아래 절차로 기상자료개방포털에서 '{aws_nm}' 시간자료를 받아 업로드하세요.")}
+                            st.rerun()
+                        elif info:
+                            rgn_, nm_, _start = info
+                            st.session_state["pending_station"] = {
+                                "obs_type": "ASOS (종관)", "region": rgn_, "stn_id": _norm_stn_id(asos_id)}
+                            _extra = ("" if d_asos <= d_aws else
+                                      f" (방재 '{aws_nm}' {d_aws:.1f}km가 더 가깝지만 종관과 "
+                                      f"{d_asos - d_aws:.1f}km 차이로 {NEAR_ASOS_PREFER_KM:g}km 미만이어서 "
+                                      f"종관을 우선 선택)")
+                            st.session_state["addr_result"] = {"kind": "asos",
+                                "msg": (f"검색 위치: {disp_addr}\n\n"
+                                        f"가장 가까운 종관(ASOS) 관측소 '{nm_}' ({rgn_}, {d_asos:.1f}km)를 "
+                                        f"자동 선택했습니다." + _extra)}
+                            st.rerun()
+                        else:
+                            st.session_state["addr_result"] = {"kind": "error",
+                                "msg": (f"가장 가까운 종관 관측소 '{asos_nm}'(지점 {asos_id})가 내장 "
+                                        f"목록에 없어 자동 선택하지 못했습니다. '관측소'에서 직접 선택하세요.")}
 
-                        st.markdown("**종관(ASOS) 최근접 3개소**")
-                        st.dataframe(
-                            near_asos[list(_disp_cols)].rename(columns=_disp_cols)
-                                .style.format({'거리(km)': '{:.2f}'}),
-                            hide_index=True, width='stretch',
-                        )
-                        st.markdown("**방재(AWS) 최근접 3개소**")
-                        st.dataframe(
-                            near_aws[list(_disp_cols)].rename(columns=_disp_cols)
-                                .style.format({'거리(km)': '{:.2f}'}),
-                            hide_index=True, width='stretch',
-                        )
-                        st.caption(
-                            "ASOS는 위 '관측소 선택'에서 해당 지점을 고르세요. "
-                            "AWS는 기상자료개방포털에서 해당 관측소명으로 CSV를 다운로드해 업로드하세요."
-                        )
+        _ar = st.session_state.get("addr_result")
+        if _ar:
+            if _ar["kind"] == "asos":
+                st.success(_ar["msg"])
+            elif _ar["kind"] == "aws":
+                st.warning(_ar["msg"])
+                st.markdown(
+                    "1. [기상자료개방포털](https://data.kma.go.kr) 접속  \n"
+                    "2. **기후통계분석 → 방재기상관측 → 시간자료**  \n"
+                    "3. 위 관측소·기간 선택 후 **CSV 다운로드**  \n"
+                    "4. 위 '관측소 선택'의 AWS 업로더에 업로드 (여러 파일 동시 가능)"
+                )
+            else:
+                st.error(_ar["msg"])
 
 with row1_col2:
     with st.container(border=True):
