@@ -895,8 +895,11 @@ def _shade_cell(cell, hex_color):
     tcPr.append(shd)
 
 
-def _add_df_table(doc, df, header_bg="D9E1F2", font_size=10):
-    from docx.shared import Pt
+def _add_df_table(doc, df, header_bg="D9E1F2", center_data=False):
+    """표 삽입. 글꼴(이름·크기)은 강제하지 않고 템플릿의 Normal 스타일을 상속한다
+    (→ 표 내부 글꼴을 템플릿에서 일괄 제어). 헤더는 음영·굵게·가운데정렬,
+    center_data=True면 데이터 셀도 가운데정렬(숫자·라벨 위주 표)."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     cols = list(df.columns)
     t = doc.add_table(rows=1, cols=len(cols))
     try:
@@ -909,17 +912,17 @@ def _add_df_table(doc, df, header_bg="D9E1F2", font_size=10):
         hdr[j].text = str(c)
         _shade_cell(hdr[j], header_bg)
         for p in hdr[j].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             for run in p.runs:
                 run.font.bold = True
-                run.font.size = Pt(font_size)
     for _, rowdata in df.iterrows():
         cells = t.add_row().cells
         for j, c in enumerate(cols):
             v = rowdata[c]
             cells[j].text = "" if pd.isna(v) else str(v)
-            for p in cells[j].paragraphs:
-                for run in p.runs:
-                    run.font.size = Pt(font_size)
+            if center_data:
+                for p in cells[j].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     return t
 
 
@@ -1051,17 +1054,17 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
 
     doc.add_heading("4.3 16방위 풍향·풍속 빈도표 (%)", level=2)
     ft = A['freq_table'].reset_index().rename(columns={'index': '방위'})
-    _add_df_table(doc, ft, font_size=8)
+    _add_df_table(doc, ft, center_data=True)
 
     doc.add_heading("4.4 방위각별 이용률 상세표 (10° 간격)", level=2)
-    _add_df_table(doc, _build_detail_table(A), font_size=9)
+    _add_df_table(doc, _build_detail_table(A), center_data=True)
     doc.add_paragraph(
         f"※ 측풍 허용치: 10kt=5.1m/s, 13kt=6.7m/s, 20kt=10.3m/s · "
         f"{USABILITY_TARGET:g}% 이상 적합 / 미만 부적합"
     )
 
     doc.add_heading("4.5 측풍 허용치별 종합", level=2)
-    _add_df_table(doc, _build_summary_table(A), font_size=8)
+    _add_df_table(doc, _build_summary_table(A), center_data=True)
 
     # 5. 최적 활주로 방향 선정
     doc.add_heading("5. 최적 활주로 방향 선정", level=1)
@@ -1071,7 +1074,7 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
         "방위각(°)": A['results'][lim]['best_angle'],
         "이용률(%)": f"{A['results'][lim]['best_usab']:.3f}",
         "판정": "적합" if A['results'][lim]['pass'] else "부적합",
-    } for lim in CROSSWIND_LIMITS_KT]))
+    } for lim in CROSSWIND_LIMITS_KT]), center_data=True)
     doc.add_paragraph(
         f"세 허용치를 종합한 결과, 최적 활주로 방향은 {rwy_name(r['best_angle'])} "
         f"(방위각 {r['best_angle']}°)로 선정되었다. 적용 허용치 {fmt_kt(primary_limit)} 기준 "
