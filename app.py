@@ -1601,65 +1601,71 @@ with row1_col1:
         addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
 
         if st.button("가까운 관측소 자동 선택", key="btn_addr_search"):
-            _kma_hub_key = st.session_state.get("kma_hub_key", "")
-            _kakao_key = st.session_state.get("kakao_key", "")
-            if not _kma_hub_key or not _kakao_key:
-                st.session_state["addr_result"] = {"kind": "error",
-                    "msg": "'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요."}
-            elif not addr_input:
-                st.session_state["addr_result"] = {"kind": "error", "msg": "주소를 입력하세요."}
-            else:
-                with st.spinner("주소 검색 중..."):
-                    lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
-                if err:
-                    st.session_state["addr_result"] = {"kind": "error", "msg": f"주소 검색 실패: {err}"}
+            try:
+                _kma_hub_key = st.session_state.get("kma_hub_key", "")
+                _kakao_key = st.session_state.get("kakao_key", "")
+                if not _kma_hub_key or not _kakao_key:
+                    st.session_state["addr_result"] = {"kind": "error",
+                        "msg": "'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요."}
+                elif not addr_input or not addr_input.strip():
+                    st.session_state["addr_result"] = {"kind": "error", "msg": "주소를 입력하세요."}
                 else:
-                    try:
-                        with st.spinner("관측소 DB 로딩 중..."):
-                            stn_db = _load_station_db(_kma_hub_key)
-                    except Exception as e:
-                        stn_db = None
-                        st.session_state["addr_result"] = {"kind": "error", "msg": f"관측소 DB 로딩 실패: {e}"}
+                    with st.spinner("주소 검색 중..."):
+                        lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
+                    if err:
+                        st.session_state["addr_result"] = {"kind": "error", "msg": f"주소 검색 실패: {err}"}
+                    else:
+                        try:
+                            with st.spinner("관측소 DB 로딩 중..."):
+                                stn_db = _load_station_db(_kma_hub_key)
+                        except Exception as e:
+                            stn_db = None
+                            st.session_state["addr_result"] = {"kind": "error", "msg": f"관측소 DB 로딩 실패: {e}"}
 
-                    if stn_db is not None and len(stn_db) > 0:
-                        na = _nearest_stations(lat, lon, stn_db, 'ASOS', n=1)
-                        nw = _nearest_stations(lat, lon, stn_db, 'AWS', n=1)
-                        d_asos = float(na.iloc[0]['dist_km']) if len(na) else float('inf')
-                        d_aws = float(nw.iloc[0]['dist_km']) if len(nw) else float('inf')
-                        asos_id = str(na.iloc[0]['stn_id']) if len(na) else None
-                        asos_nm = na.iloc[0]['name_ko'] if len(na) else '—'
-                        aws_nm = nw.iloc[0]['name_ko'] if len(nw) else '—'
-                        info = _ASOS_ID_TO_INFO.get(_norm_stn_id(asos_id)) if asos_id else None
-                        pick_aws = (d_aws < d_asos) and ((d_asos - d_aws) >= NEAR_ASOS_PREFER_KM)
-
-                        if pick_aws:
-                            st.session_state["pending_station"] = {
-                                "obs_type": "AWS (방재) — CSV 업로드", "name": aws_nm}
-                            st.session_state["addr_result"] = {"kind": "aws",
-                                "msg": (f"검색 위치: {disp_addr}\n\n"
-                                        f"가장 가까운 관측소는 방재(AWS) '{aws_nm}' ({d_aws:.1f}km)로, "
-                                        f"가장 가까운 종관(ASOS) '{asos_nm}' ({d_asos:.1f}km)보다 "
-                                        f"{d_asos - d_aws:.1f}km 더 가깝습니다. 방재 자료는 기간조회 API가 "
-                                        f"없어 CSV 업로드로 분석하므로, 관측종류를 방재(AWS)로 전환했습니다. "
-                                        f"아래 절차로 기상자료개방포털에서 '{aws_nm}' 시간자료를 받아 업로드하세요.")}
-                            st.rerun()
-                        elif info:
-                            rgn_, nm_, _start = info
-                            st.session_state["pending_station"] = {
-                                "obs_type": "ASOS (종관)", "region": rgn_, "stn_id": _norm_stn_id(asos_id)}
-                            _extra = ("" if d_asos <= d_aws else
-                                      f" (방재 '{aws_nm}' {d_aws:.1f}km가 더 가깝지만 종관과 "
-                                      f"{d_asos - d_aws:.1f}km 차이로 {NEAR_ASOS_PREFER_KM:g}km 미만이어서 "
-                                      f"종관을 우선 선택)")
-                            st.session_state["addr_result"] = {"kind": "asos",
-                                "msg": (f"검색 위치: {disp_addr}\n\n"
-                                        f"가장 가까운 종관(ASOS) 관측소 '{nm_}' ({rgn_}, {d_asos:.1f}km)를 "
-                                        f"자동 선택했습니다." + _extra)}
-                            st.rerun()
-                        else:
+                        if stn_db is None or len(stn_db) == 0:
                             st.session_state["addr_result"] = {"kind": "error",
-                                "msg": (f"가장 가까운 종관 관측소 '{asos_nm}'(지점 {asos_id})가 내장 "
-                                        f"목록에 없어 자동 선택하지 못했습니다. '관측소'에서 직접 선택하세요.")}
+                                "msg": "관측소 DB를 불러오지 못했습니다. 기상청 API 허브 인증키를 확인하세요."}
+                        else:
+                            na = _nearest_stations(lat, lon, stn_db, 'ASOS', n=1)
+                            nw = _nearest_stations(lat, lon, stn_db, 'AWS', n=1)
+                            d_asos = float(na.iloc[0]['dist_km']) if len(na) else float('inf')
+                            d_aws = float(nw.iloc[0]['dist_km']) if len(nw) else float('inf')
+                            asos_id = str(na.iloc[0]['stn_id']) if len(na) else None
+                            asos_nm = na.iloc[0]['name_ko'] if len(na) else '—'
+                            aws_nm = nw.iloc[0]['name_ko'] if len(nw) else '—'
+                            info = _ASOS_ID_TO_INFO.get(_norm_stn_id(asos_id)) if asos_id else None
+                            pick_aws = (d_aws < d_asos) and ((d_asos - d_aws) >= NEAR_ASOS_PREFER_KM)
+
+                            if pick_aws:
+                                st.session_state["pending_station"] = {
+                                    "obs_type": "AWS (방재) — CSV 업로드", "name": aws_nm}
+                                st.session_state["addr_result"] = {"kind": "aws",
+                                    "msg": (f"검색 위치: {disp_addr}\n\n"
+                                            f"가장 가까운 관측소는 방재(AWS) '{aws_nm}' ({d_aws:.1f}km)로, "
+                                            f"가장 가까운 종관(ASOS) '{asos_nm}' ({d_asos:.1f}km)보다 "
+                                            f"{d_asos - d_aws:.1f}km 더 가깝습니다. 방재 자료는 기간조회 API가 "
+                                            f"없어 CSV 업로드로 분석하므로, 관측종류를 방재(AWS)로 전환했습니다. "
+                                            f"아래 절차로 기상자료개방포털에서 '{aws_nm}' 시간자료를 받아 업로드하세요.")}
+                                st.rerun()
+                            elif info:
+                                rgn_, nm_, _start = info
+                                st.session_state["pending_station"] = {
+                                    "obs_type": "ASOS (종관)", "region": rgn_, "stn_id": _norm_stn_id(asos_id)}
+                                _extra = ("" if d_asos <= d_aws else
+                                          f" (방재 '{aws_nm}' {d_aws:.1f}km가 더 가깝지만 종관과 "
+                                          f"{d_asos - d_aws:.1f}km 차이로 {NEAR_ASOS_PREFER_KM:g}km 미만이어서 "
+                                          f"종관을 우선 선택)")
+                                st.session_state["addr_result"] = {"kind": "asos",
+                                    "msg": (f"검색 위치: {disp_addr}\n\n"
+                                            f"가장 가까운 종관(ASOS) 관측소 '{nm_}' ({rgn_}, {d_asos:.1f}km)를 "
+                                            f"자동 선택했습니다." + _extra)}
+                                st.rerun()
+                            else:
+                                st.session_state["addr_result"] = {"kind": "error",
+                                    "msg": (f"가장 가까운 종관 관측소 '{asos_nm}'(지점 {asos_id})가 내장 "
+                                            f"목록에 없어 자동 선택하지 못했습니다. '관측소'에서 직접 선택하세요.")}
+            except Exception as e:
+                st.session_state["addr_result"] = {"kind": "error", "msg": f"주소검색 중 예상치 못한 오류: {e}"}
 
         _ar = st.session_state.get("addr_result")
         if _ar:
