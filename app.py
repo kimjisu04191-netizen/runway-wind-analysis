@@ -44,19 +44,17 @@ for _sk, _sname in [("api_key", "ASOS_API_KEY"), ("kma_hub_key", "KMA_HUB_KEY"),
 
 @st.dialog("API 키 설정")
 def _api_key_dialog():
+    # key로 session_state에 직접 바인딩 — value=를 함께 주면 Streamlit 이중 상태 경고 발생
     st.text_input(
         "ASOS API Key (Decoding)", type="password", key="api_key",
-        value=st.session_state.get("api_key", ""),
         help="공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키",
     )
     st.text_input(
         "기상청 API 허브 인증키", type="password", key="kma_hub_key",
-        value=st.session_state.get("kma_hub_key", ""),
         help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회 및 주소검색용)",
     )
     st.text_input(
         "카카오 REST API 키", type="password", key="kakao_key",
-        value=st.session_state.get("kakao_key", ""),
         help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
              "별도 승인 대기 없이 바로 사용 가능합니다.",
     )
@@ -292,6 +290,32 @@ def _fetch_one(session, key, stn, start_dt, end_dt):
     return items_all
 
 # --- [캐시 데이터] 월별 병렬 수집 함수 ---
+@st.cache_data(show_spinner=False)
+def _build_quality_excel(df_valid, df_invalid):
+    """데이터 품질 보고서(Excel 2-시트) bytes 생성.
+    10년치(~9만 행) 기록에 약 3초가 걸리므로 캐시해, 같은 데이터로
+    허용치·활주로 길이만 바꿔 재분석할 때 재생성을 건너뛴다."""
+    buf = io.BytesIO()
+    cols = [c for c in ['tm', 'wd', 'ws', 'ws_kt'] if c in df_valid.columns]
+    valid_export = df_valid[cols].copy() if cols else df_valid.copy()
+    rename_map = {'tm': '관측시각', 'wd': '풍향(°)', 'ws': '풍속(m/s)', 'ws_kt': '풍속(kt)'}
+    valid_export.rename(columns=rename_map, inplace=True)
+    try:
+        import xlsxwriter  # noqa: F401  — openpyxl보다 다소 빠름, 없으면 폴백
+        engine = 'xlsxwriter'
+    except ImportError:
+        engine = 'openpyxl'
+    with pd.ExcelWriter(buf, engine=engine) as writer:
+        valid_export.to_excel(writer, sheet_name='유효_데이터', index=False)
+        if df_invalid is not None and len(df_invalid) > 0:
+            inv_export = df_invalid.copy()
+            inv_export.rename(columns=rename_map, inplace=True)
+            inv_export.to_excel(writer, sheet_name='결측_데이터', index=False)
+        else:
+            pd.DataFrame({"안내": ["결측 데이터가 없습니다."]}).to_excel(
+                writer, sheet_name='결측_데이터', index=False)
+    return buf.getvalue()
+
 @st.cache_data(show_spinner=False)
 def get_weather_data_v28(key, stn, s_date, e_date):
     chunks = _month_chunks(s_date, e_date)
@@ -664,10 +688,9 @@ def _build_freq_table(wd, ws, N_total):
         spd_idx[ws > t] = i + 1                       # (0,3]→0, (3,10]→1, … (20,∞)→4
     # 22.5° 간격, 첫 섹터 N은 348.75°~11.25° 중심
     dir_idx = (((wd + 11.25) // 22.5) % 16).astype(np.int32)
-    table = np.zeros((16, len(speed_labels)), dtype=np.float64)
-    for d in range(16):
-        for s in range(len(speed_labels)):
-            table[d, s] = ((dir_idx == d) & (spd_idx == s)).sum()
+    n_spd = len(speed_labels)
+    table = np.bincount(dir_idx * n_spd + spd_idx,
+                        minlength=16 * n_spd).reshape(16, n_spd).astype(np.float64)
     pct = table / N_total * 100.0
     df_out = pd.DataFrame(pct, index=dir_names, columns=speed_labels).round(2)
     df_out['TOTAL %'] = df_out.sum(axis=1).round(2)
@@ -704,10 +727,7 @@ def _render_windrose_png(wd, ws_kt):
     for i, t in enumerate(spd_thresh):
         spd_idx[ws_eff > t] = i + 1
 
-    freq = np.zeros((16, 6))
-    for d in range(16):
-        for s in range(6):
-            freq[d, s] = ((dir_idx == d) & (spd_idx == s)).sum() / N * 100.0
+    freq = np.bincount(dir_idx * 6 + spd_idx, minlength=96).reshape(16, 6) / N * 100.0
 
     theta = np.deg2rad(np.arange(0, 360, 22.5))
     width = np.deg2rad(22.5) * 0.9
@@ -1601,65 +1621,71 @@ with row1_col1:
         addr_input = st.text_input("주소 입력", placeholder="예: 대구 동구 동대구로 550")
 
         if st.button("가까운 관측소 자동 선택", key="btn_addr_search"):
-            _kma_hub_key = st.session_state.get("kma_hub_key", "")
-            _kakao_key = st.session_state.get("kakao_key", "")
-            if not _kma_hub_key or not _kakao_key:
-                st.session_state["addr_result"] = {"kind": "error",
-                    "msg": "'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요."}
-            elif not addr_input:
-                st.session_state["addr_result"] = {"kind": "error", "msg": "주소를 입력하세요."}
-            else:
-                with st.spinner("주소 검색 중..."):
-                    lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
-                if err:
-                    st.session_state["addr_result"] = {"kind": "error", "msg": f"주소 검색 실패: {err}"}
+            try:
+                _kma_hub_key = st.session_state.get("kma_hub_key", "")
+                _kakao_key = st.session_state.get("kakao_key", "")
+                if not _kma_hub_key or not _kakao_key:
+                    st.session_state["addr_result"] = {"kind": "error",
+                        "msg": "'API 키 설정' 팝업에서 기상청 API 허브 인증키와 카카오 REST API 키를 먼저 입력하세요."}
+                elif not addr_input or not addr_input.strip():
+                    st.session_state["addr_result"] = {"kind": "error", "msg": "주소를 입력하세요."}
                 else:
-                    try:
-                        with st.spinner("관측소 DB 로딩 중..."):
-                            stn_db = _load_station_db(_kma_hub_key)
-                    except Exception as e:
-                        stn_db = None
-                        st.session_state["addr_result"] = {"kind": "error", "msg": f"관측소 DB 로딩 실패: {e}"}
+                    with st.spinner("주소 검색 중..."):
+                        lat, lon, disp_addr, err = _geocode_address_kakao(addr_input, _kakao_key)
+                    if err:
+                        st.session_state["addr_result"] = {"kind": "error", "msg": f"주소 검색 실패: {err}"}
+                    else:
+                        try:
+                            with st.spinner("관측소 DB 로딩 중..."):
+                                stn_db = _load_station_db(_kma_hub_key)
+                        except Exception as e:
+                            stn_db = None
+                            st.session_state["addr_result"] = {"kind": "error", "msg": f"관측소 DB 로딩 실패: {e}"}
 
-                    if stn_db is not None and len(stn_db) > 0:
-                        na = _nearest_stations(lat, lon, stn_db, 'ASOS', n=1)
-                        nw = _nearest_stations(lat, lon, stn_db, 'AWS', n=1)
-                        d_asos = float(na.iloc[0]['dist_km']) if len(na) else float('inf')
-                        d_aws = float(nw.iloc[0]['dist_km']) if len(nw) else float('inf')
-                        asos_id = str(na.iloc[0]['stn_id']) if len(na) else None
-                        asos_nm = na.iloc[0]['name_ko'] if len(na) else '—'
-                        aws_nm = nw.iloc[0]['name_ko'] if len(nw) else '—'
-                        info = _ASOS_ID_TO_INFO.get(_norm_stn_id(asos_id)) if asos_id else None
-                        pick_aws = (d_aws < d_asos) and ((d_asos - d_aws) >= NEAR_ASOS_PREFER_KM)
-
-                        if pick_aws:
-                            st.session_state["pending_station"] = {
-                                "obs_type": "AWS (방재) — CSV 업로드", "name": aws_nm}
-                            st.session_state["addr_result"] = {"kind": "aws",
-                                "msg": (f"검색 위치: {disp_addr}\n\n"
-                                        f"가장 가까운 관측소는 방재(AWS) '{aws_nm}' ({d_aws:.1f}km)로, "
-                                        f"가장 가까운 종관(ASOS) '{asos_nm}' ({d_asos:.1f}km)보다 "
-                                        f"{d_asos - d_aws:.1f}km 더 가깝습니다. 방재 자료는 기간조회 API가 "
-                                        f"없어 CSV 업로드로 분석하므로, 관측종류를 방재(AWS)로 전환했습니다. "
-                                        f"아래 절차로 기상자료개방포털에서 '{aws_nm}' 시간자료를 받아 업로드하세요.")}
-                            st.rerun()
-                        elif info:
-                            rgn_, nm_, _start = info
-                            st.session_state["pending_station"] = {
-                                "obs_type": "ASOS (종관)", "region": rgn_, "stn_id": _norm_stn_id(asos_id)}
-                            _extra = ("" if d_asos <= d_aws else
-                                      f" (방재 '{aws_nm}' {d_aws:.1f}km가 더 가깝지만 종관과 "
-                                      f"{d_asos - d_aws:.1f}km 차이로 {NEAR_ASOS_PREFER_KM:g}km 미만이어서 "
-                                      f"종관을 우선 선택)")
-                            st.session_state["addr_result"] = {"kind": "asos",
-                                "msg": (f"검색 위치: {disp_addr}\n\n"
-                                        f"가장 가까운 종관(ASOS) 관측소 '{nm_}' ({rgn_}, {d_asos:.1f}km)를 "
-                                        f"자동 선택했습니다." + _extra)}
-                            st.rerun()
-                        else:
+                        if stn_db is None or len(stn_db) == 0:
                             st.session_state["addr_result"] = {"kind": "error",
-                                "msg": (f"가장 가까운 종관 관측소 '{asos_nm}'(지점 {asos_id})가 내장 "
-                                        f"목록에 없어 자동 선택하지 못했습니다. '관측소'에서 직접 선택하세요.")}
+                                "msg": "관측소 DB를 불러오지 못했습니다. 기상청 API 허브 인증키를 확인하세요."}
+                        else:
+                            na = _nearest_stations(lat, lon, stn_db, 'ASOS', n=1)
+                            nw = _nearest_stations(lat, lon, stn_db, 'AWS', n=1)
+                            d_asos = float(na.iloc[0]['dist_km']) if len(na) else float('inf')
+                            d_aws = float(nw.iloc[0]['dist_km']) if len(nw) else float('inf')
+                            asos_id = str(na.iloc[0]['stn_id']) if len(na) else None
+                            asos_nm = na.iloc[0]['name_ko'] if len(na) else '—'
+                            aws_nm = nw.iloc[0]['name_ko'] if len(nw) else '—'
+                            info = _ASOS_ID_TO_INFO.get(_norm_stn_id(asos_id)) if asos_id else None
+                            pick_aws = (d_aws < d_asos) and ((d_asos - d_aws) >= NEAR_ASOS_PREFER_KM)
+
+                            if pick_aws:
+                                st.session_state["pending_station"] = {
+                                    "obs_type": "AWS (방재) — CSV 업로드", "name": aws_nm}
+                                st.session_state["addr_result"] = {"kind": "aws",
+                                    "msg": (f"검색 위치: {disp_addr}\n\n"
+                                            f"가장 가까운 관측소는 방재(AWS) '{aws_nm}' ({d_aws:.1f}km)로, "
+                                            f"가장 가까운 종관(ASOS) '{asos_nm}' ({d_asos:.1f}km)보다 "
+                                            f"{d_asos - d_aws:.1f}km 더 가깝습니다. 방재 자료는 기간조회 API가 "
+                                            f"없어 CSV 업로드로 분석하므로, 관측종류를 방재(AWS)로 전환했습니다. "
+                                            f"아래 절차로 기상자료개방포털에서 '{aws_nm}' 시간자료를 받아 업로드하세요.")}
+                                st.rerun()
+                            elif info:
+                                rgn_, nm_, _start = info
+                                st.session_state["pending_station"] = {
+                                    "obs_type": "ASOS (종관)", "region": rgn_, "stn_id": _norm_stn_id(asos_id)}
+                                _extra = ("" if d_asos <= d_aws else
+                                          f" (방재 '{aws_nm}' {d_aws:.1f}km가 더 가깝지만 종관과 "
+                                          f"{d_asos - d_aws:.1f}km 차이로 {NEAR_ASOS_PREFER_KM:g}km 미만이어서 "
+                                          f"종관을 우선 선택)")
+                                st.session_state["addr_result"] = {"kind": "asos",
+                                    "msg": (f"검색 위치: {disp_addr}\n\n"
+                                            f"가장 가까운 종관(ASOS) 관측소 '{nm_}' ({rgn_}, {d_asos:.1f}km)를 "
+                                            f"자동 선택했습니다." + _extra)}
+                                st.rerun()
+                            else:
+                                st.session_state["addr_result"] = {"kind": "error",
+                                    "msg": (f"가장 가까운 종관 관측소 '{asos_nm}'(지점 {asos_id})가 내장 "
+                                            f"목록에 없어 자동 선택하지 못했습니다. '관측소'에서 직접 선택하세요.")}
+            except Exception as e:
+                st.session_state["addr_result"] = {"kind": "error", "msg": f"주소검색 중 예상치 못한 오류: {e}"}
 
         _ar = st.session_state.get("addr_result")
         if _ar:
@@ -1908,16 +1934,12 @@ if run_clicked:
                     _spd_idx[_ws_eff > _t] = _i + 1                    # 초과(>) 기준 bin 배정
 
                 # 집계 (16 × 6) → 전체 관측(Calm 포함) 대비 % → 막대 합 + Calm% = 100%
-                _rose_rows = []
-                for _d in range(16):
-                    for _s in range(6):
-                        _cnt = int(((_dir_idx == _d) & (_spd_idx == _s)).sum())
-                        _rose_rows.append({
-                            'angle':     float(_dir_ang[_d]),
-                            'speed_bin': _spd_labels[_s],
-                            'freq_pct':  _cnt / _N_r * 100.0,
-                        })
-                _df_rose = pd.DataFrame(_rose_rows)
+                _rose_cnt = np.bincount(_dir_idx * 6 + _spd_idx, minlength=96).reshape(16, 6)
+                _df_rose = pd.DataFrame({
+                    'angle':     np.repeat(_dir_ang, 6),
+                    'speed_bin': np.tile(_spd_labels, 16),
+                    'freq_pct':  _rose_cnt.ravel() / _N_r * 100.0,
+                })
 
                 # 이산 색상 (오름차순: 연한색 → 진한색)
                 _color_seq = ["#c6dbef", "#74c476", "#fdd835", "#fd8d3c", "#e31a1c", "#67000d"]
@@ -2071,28 +2093,12 @@ if run_clicked:
                 "**결측**: 풍향 또는 풍속이 누락된 시각 (장비 오류·통신 두절 등) → 분석에서 제외됨"
             )
 
-            # Excel 2-시트 다운로드 (유효 / 결측)
-            _excel_buf = io.BytesIO()
-            # 유효 데이터: 주요 컬럼만 선별해 가독성 확보
-            _valid_export_cols = [c for c in ['tm', 'wd', 'ws', 'ws_kt'] if c in df.columns]
-            _valid_export = df[_valid_export_cols].copy() if _valid_export_cols else df.copy()
-            _rename_map = {'tm': '관측시각', 'wd': '풍향(°)', 'ws': '풍속(m/s)', 'ws_kt': '풍속(kt)'}
-            _valid_export.rename(columns=_rename_map, inplace=True)
-
-            with pd.ExcelWriter(_excel_buf, engine='openpyxl') as _writer:
-                _valid_export.to_excel(_writer, sheet_name='유효_데이터', index=False)
-                if _n_invalid > 0:
-                    _inv_export = df_invalid_rows.copy()
-                    _inv_export.rename(columns=_rename_map, inplace=True)
-                    _inv_export.to_excel(_writer, sheet_name='결측_데이터', index=False)
-                else:
-                    pd.DataFrame({"안내": ["결측 데이터가 없습니다."]}).to_excel(
-                        _writer, sheet_name='결측_데이터', index=False
-                    )
+            # Excel 2-시트 다운로드 (유효 / 결측) — 생성 결과는 캐시됨
+            _excel_bytes = _build_quality_excel(df, df_invalid_rows)
 
             st.download_button(
                 "데이터 품질 보고서 다운로드 (Excel)",
-                _excel_buf.getvalue(),
+                _excel_bytes,
                 file_name=f"data_quality_{stn_name}_{_chart_start}_{_chart_end}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
