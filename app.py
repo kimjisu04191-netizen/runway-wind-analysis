@@ -29,13 +29,17 @@ div[data-testid="stExpander"] summary p { font-size: 0.88rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- [개인용 기본값] secrets.toml에 저장된 키를 세션 상태 기본값으로 자동 채움.
-#     secrets.toml은 .gitignore 처리되어 GitHub(public repo)에는 절대 올라가지 않음.
+# --- [개인용 기본값] secrets.toml(로컬) 또는 환경변수(Cloud Run 등 배포 환경)에
+#     저장된 키를 세션 상태 기본값으로 자동 채움. secrets.toml은 .gitignore 처리되어
+#     GitHub(public repo)에는 절대 올라가지 않음.
 def _secret(name, default=""):
     try:
-        return st.secrets.get(name, default)
+        val = st.secrets.get(name, "")
+        if val:
+            return val
     except Exception:
-        return default
+        pass
+    return os.environ.get(name, default)
 
 # API 키는 메인 화면에 직접 노출하지 않고 세션 상태로만 보관 → 팝업(dialog)에서 입력/수정
 for _sk, _sname in [("api_key", "ASOS_API_KEY"), ("kma_hub_key", "KMA_HUB_KEY"), ("kakao_key", "KAKAO_REST_KEY")]:
