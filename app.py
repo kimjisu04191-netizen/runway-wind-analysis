@@ -709,7 +709,7 @@ def _build_freq_table(wd, ws, N_total):
 # 문서 본문·표·제목의 한글은 Word 자체 폰트(맑은 고딕)로 렌더링한다.
 
 def _render_windrose_png(wd, ws_kt):
-    """16방위 × 6풍속구간 풍배도 → PNG bytes (matplotlib polar stacked bar)."""
+    """16방위 × 6풍속구간 바람장미 → PNG bytes (matplotlib polar stacked bar)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1283,21 +1283,21 @@ def build_review_docx(A, df, stn_name, chart_start, chart_end, primary_limit,
     td = S['top_dirs']
     p10, p13, p20 = S['perlim'][10], S['perlim'][13], S['perlim'][20]
 
-    doc.add_heading("4.1 풍배도 (Wind Rose)", level=2)
+    doc.add_heading("4.1 바람장미 (Wind Rose)", level=2)
     rose_png = _render_windrose_png(
         df['wd'].to_numpy(dtype=float), df['ws_kt'].to_numpy(dtype=float))
     doc.add_picture(io.BytesIO(rose_png), width=Cm(11.5))
     doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _add_caption(doc, "그림 1. 16방위 풍배도 (중앙 원: 0.5 m/s 이하 정온 비율)")
+    _add_caption(doc, "그림 1. 16방위 바람장미 (중앙 원: 0.5 m/s 이하 정온 비율)")
     doc.add_paragraph(
-        f"풍배도 분석 결과, 대상 관측소의 주풍은 {td[0][1]}({td[0][0]}) 방향을 중심으로 분포하며, "
+        f"바람장미 분석 결과, 대상 관측소의 주풍은 {td[0][1]}({td[0][0]}) 방향을 중심으로 분포하며, "
         f"{td[0][1]} 방향이 전체 관측시간의 {td[0][2]:.2f}%를 차지하여 가장 높은 빈도를 보였다. "
         f"이어 {td[1][1]}({td[1][0]}, {td[1][2]:.2f}%), {td[2][1]}({td[2][0]}, {td[2][2]:.2f}%) "
         f"방향에서도 상대적으로 높은 빈도가 관측되었다. 이러한 주풍 분포는 후술하는 최적 활주로 "
         f"방향 산정 결과와 연계하여 해석된다."
     )
     doc.add_paragraph(
-        f"한편 풍배도 중앙에 표기된 정온(Calm) 비율 {S['calm_rose_pct']:.1f}%는 풍속 0.5m/s "
+        f"한편 바람장미 중앙에 표기된 정온(Calm) 비율 {S['calm_rose_pct']:.1f}%는 풍속 0.5m/s "
         f"이하를 기준으로 산정된 값으로, 활주로 이용률 산정에 적용한 정온 기준"
         f"({calm_lbl} 이하, {A['calm_pct']:.2f}%)과는 임계풍속 기준이 상이하므로 상호 혼동하지 "
         f"않도록 유의할 필요가 있다. 이용률 분석에는 2·3장에서 정의한 {calm_lbl} 기준의 정온 "
@@ -2115,7 +2115,7 @@ if run_clicked:
             st.divider()
             st.subheader("활주로 방향 검토서 생성")
             st.caption(
-                "분석 결과를 ICAO 기준 검토서(.docx)로 내보냅니다. 풍배도·이용률 곡선·"
+                "분석 결과를 ICAO 기준 검토서(.docx)로 내보냅니다. 바람장미·이용률 곡선·"
                 "빈도표·상세표가 자동 삽입되며, 개요·결론 등 서술 항목([ 작성 ] 표시)은 "
                 "생성 후 Word/HWP에서 직접 작성하면 됩니다."
             )
