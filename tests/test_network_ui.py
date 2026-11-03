@@ -1,5 +1,5 @@
 from datetime import date
-from unittest.mock import Mock
+from unittest.mock import Mock, MagicMock
 
 import pytest
 import requests
@@ -51,7 +51,7 @@ def test_station_denied_and_kakao_errors_do_not_leak_key(core, monkeypatch):
 
 
 def test_partial_failure_is_not_success(core, monkeypatch):
-    monkeypatch.setattr(core, 'st', Mock())
+    monkeypatch.setattr(core, 'st', MagicMock())
     def fetch(key, stn, start, end):
         if start == '20250201':
             raise requests.ConnectionError('fake-key')

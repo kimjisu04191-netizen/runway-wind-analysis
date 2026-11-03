@@ -8,10 +8,12 @@ import plotly.express as px
 import time
 from datetime import datetime, date, timedelta
 from calendar import monthrange
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from wind_data import prepare_observations, parse_aws_csv, safe_excel_frame, coverage_summary
+from weather_errors import WeatherAPIError, api_error, response_error_code
+from browser_keys import mount_browser_store, queue_browser_command
 
 # 1. 페이지 설정
 st.set_page_config(page_title="활주로 이용률 정밀 분석", layout="wide")
@@ -44,26 +46,57 @@ def _secret(name, default=""):
 
 def _get_api_key(widget_key, secret_name):
     # 서버 키를 위젯 상태에 넣으면 password 입력이어도 브라우저로 전송된다.
-    return st.session_state.get(widget_key, "").strip() or _secret(secret_name)
+    return st.session_state.get('user_api_keys', {}).get(widget_key, '').strip() or _secret(secret_name)
+
+
+def _remember_user_key(widget_key):
+    keys = dict(st.session_state.get('user_api_keys', {}))
+    keys[widget_key] = st.session_state.get(widget_key, '').strip()
+    st.session_state['user_api_keys'] = keys
 
 @st.dialog("API 키 설정")
 def _api_key_dialog():
+    for key in ('api_key', 'kma_hub_key', 'kakao_key'):
+        if key not in st.session_state:
+            st.session_state[key] = st.session_state.get('user_api_keys', {}).get(key, '')
+    st.info("ASOS 기상자료 분석은 ASOS API 키 하나로 실행할 수 있습니다. 아래 두 키는 주소로 관측소를 찾을 때만 필요합니다.")
     # key로 session_state에 직접 바인딩 — value=를 함께 주면 Streamlit 이중 상태 경고 발생
     st.text_input(
         "ASOS API Key (Decoding)", type="password", key="api_key",
+        on_change=_remember_user_key, args=('api_key',),
         help="공공데이터포털(data.go.kr)에서 발급받은 종관기상관측(ASOS) Decoding 키",
     )
     st.text_input(
         "기상청 API 허브 인증키", type="password", key="kma_hub_key",
+        on_change=_remember_user_key, args=('kma_hub_key',),
         help="apihub.kma.go.kr에서 발급받은 인증키 (관측소 위경도 조회 및 주소검색용)",
     )
     st.text_input(
         "카카오 REST API 키", type="password", key="kakao_key",
+        on_change=_remember_user_key, args=('kakao_key',),
         help="Kakao Developers(developers.kakao.com)에서 앱 생성 후 즉시 발급되는 REST API 키. "
              "별도 승인 대기 없이 바로 사용 가능합니다.",
     )
     st.caption("서버에 설정된 키는 표시하지 않습니다. 빈칸은 서버 설정을 사용하며, 입력한 키는 현재 세션에서 우선 적용됩니다.")
+    st.markdown('**API 키 재사용**')
+    st.caption('기본은 저장하지 않음입니다. 직접 저장하면 같은 브라우저·같은 주소에서 자동으로 불러옵니다. 암호화 없이 저장되므로 개인 기기에서만 사용하세요. 시크릿 모드나 사이트 데이터 삭제 시에는 유지되지 않습니다.')
+    save_col, delete_col = st.columns(2)
+    with save_col:
+        if st.button('이 브라우저에 저장', use_container_width=True):
+            for key in ('api_key', 'kma_hub_key', 'kakao_key'):
+                _remember_user_key(key)
+            if not any(st.session_state['user_api_keys'].values()):
+                st.warning('직접 입력한 키가 없습니다. 서버에 설정된 키는 브라우저에 저장하지 않습니다.')
+            else:
+                queue_browser_command('save')
+                st.rerun()
+    with delete_col:
+        if st.button('저장된 키 삭제', use_container_width=True):
+            queue_browser_command('delete')
+            st.rerun()
     if st.button("닫기", type="primary", use_container_width=True):
+        for key in ('api_key', 'kma_hub_key', 'kakao_key'):
+            _remember_user_key(key)
         st.rerun()
 
 # 제목 + API 키 설정 버튼 (같은 행에 배치)
@@ -76,7 +109,9 @@ with title_col2:
     if st.button("API 키 설정", use_container_width=True):
         _api_key_dialog()
 
+mount_browser_store()
 api_key = _get_api_key("api_key", "ASOS_API_KEY")
+st.caption('ASOS 분석에는 공공데이터포털의 ASOS 시간자료 Decoding 키만 필요합니다. 주소 자동검색은 선택 기능입니다.')
 
 # --- [내장 데이터] 광역시도 → (ASOS 종관 / AWS 방재) 관측소 계층 ---
 # ASOS: 기상청 종관기상관측망 전체 (94개소) — AsosHourlyInfoService API로 시간자료 제공
@@ -233,7 +268,7 @@ STATION_DB = {sid: [v[1], v[3]] for sid, v in STATION_LOOKUP.items()}
 API_URL = "https://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList"
 MAX_WORKERS = 8          # 병렬 요청 수 (공공데이터 포털 권장 범위 내)
 REQUEST_TIMEOUT = 20     # 단건 타임아웃
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 
 def _make_session():
     """Keep-Alive + 자동 재시도 세션. 커넥션 풀링으로 TCP/TLS 핸드쉐이크 비용 절감."""
@@ -277,23 +312,32 @@ def _fetch_one(session, key, stn, start_dt, end_dt):
         }
         try:
             r = session.get(API_URL, params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        except requests.Timeout:
+            raise WeatherAPIError("연결/응답 시간 초과: 기상청 응답이 늦습니다. 기간을 줄이거나 잠시 후 재시도하세요.") from None
         except requests.RequestException:
-            raise RuntimeError("기상자료 서버 연결 실패 (인증키·네트워크·서비스 상태 확인)") from None
+            raise WeatherAPIError("기상자료 서버 연결 실패: 네트워크 또는 서비스 상태를 확인하고 재시도하세요.") from None
         if r.status_code != 200:
             # data.go.kr 게이트웨이 오류(502 등) → 원인을 명확히 전달 (JSON 파싱 전에 차단)
-            raise RuntimeError(f"기상자료 서버 HTTP {r.status_code}")
+            if r.status_code == 429:
+                raise api_error('22')
+            if r.status_code in (401, 403):
+                raise api_error('20')
+            raise WeatherAPIError(f"기상자료 서버 HTTP {r.status_code}: 일시적 장애일 수 있습니다. 잠시 후 재시도하세요.")
         try:
             res = r.json()
         except ValueError:
             # 응답 본문이나 요청 URL에는 인증키가 포함될 수 있어 표시하지 않는다.
-            raise RuntimeError("기상자료 서버의 비정상 응답 (인증키·서비스 상태 확인)") from None
+            code = response_error_code(r.text)
+            if code:
+                raise api_error(code) from None
+            raise WeatherAPIError("비정상 응답: 공공데이터포털의 ASOS 시간자료 서비스 활용신청 승인 여부와 Decoding 키를 확인하세요.") from None
         response = res.get('response', {}) if isinstance(res, dict) else {}
         header = response.get('header', {})
         code = str(header.get('resultCode', ''))
         if code == '03':
             break
         if code != '00':
-            raise RuntimeError("기상자료 API 오류 (인증키·서비스 승인·호출 한도 확인)")
+            raise api_error(code)
         body = response.get('body', {})
         item_block = body.get('items') or {}
         items = item_block.get('item', []) if isinstance(item_block, dict) else []
@@ -317,6 +361,7 @@ def _fetch_one(session, key, stn, start_dt, end_dt):
     return items_all
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=512)
 def _fetch_month(key, stn, start_dt, end_dt):
     with _make_session() as session:
         return _fetch_one(session, key, stn, start_dt, end_dt)
@@ -349,49 +394,55 @@ def _build_quality_excel(df_valid, df_invalid):
                 writer, sheet_name='결측_데이터', index=False)
     return buf.getvalue()
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=8)
 def get_weather_data_v28(key, stn, s_date, e_date):
     if s_date > e_date or e_date >= date.today():
         return None, None, "기간은 시작일 ≤ 종료일이며 종료일은 어제까지여야 합니다."
     if (e_date - s_date).days > 366 * 30:
         return None, None, "한 번에 최대 30년까지 분석할 수 있습니다."
     chunks = _month_chunks(s_date, e_date)
-    total = len(chunks)
-    if total == 0:
+    if not chunks:
         return None, None, "날짜 범위가 비어 있습니다."
-
-    msg_slot = st.empty()
-    p_bar = st.progress(0)
-    msg_slot.info(f"⏳ {total}개월 데이터 병렬 수집 중... (동시 요청 {MAX_WORKERS}건)")
-
-    all_combined = []
-    done = 0
+    total, done, all_combined = len(chunks), 0, []
     t0 = time.perf_counter()
-
-    failed = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_month, key, stn, s, e): (s, e) for s, e in chunks}
-        for fut in as_completed(futures):
-            s, e = futures[fut]
+    with st.status("1/4 · ASOS 인증 확인 및 기상자료 수집", expanded=True) as status:
+        st.write("첫 구간의 인증과 응답을 확인한 뒤 나머지 기간을 병렬 수집합니다. 이전에 수집한 자료는 재사용합니다.")
+        progress = st.progress(0, text=f"인증·첫 응답 대기 중 · 0/{total}개월")
+        def update(note):
+            progress.progress(done / total, text=f"{note} · {done}/{total}개월 · {len(all_combined):,}행 · 경과 {time.perf_counter()-t0:.0f}초")
+        try:
+            first_start, first_end = chunks[0]
+            all_combined.extend(_fetch_month(key, stn, first_start, first_end))
+            done = 1
+            update('수집 진행')
+            pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            futures = {pool.submit(_fetch_month, key, stn, start, end): (start, end) for start, end in chunks[1:]}
             try:
-                items = fut.result()
-                if items:
-                    all_combined.extend(items)
-            except Exception:
-                # 실패를 캐시하지 않도록 수집 완료 후 예외로 전달한다.
-                failed.append(f"{s}~{e}")
-            done += 1
-            p_bar.progress(done / total)
-            msg_slot.info(f"⏳ 수집 진행 {done}/{total}개월 · 경과 {time.perf_counter()-t0:.1f}s")
-
-    if failed:
-        msg_slot.error("일부 기간 수집에 실패하여 분석을 중단했습니다.")
-        raise RuntimeError(f"구간 수집 실패 {len(failed)}/{total}건 (예: {failed[0]}). 재시도하세요.") from None
-    msg_slot.success(f"수집 완료 · {len(all_combined):,}행 · 총 {time.perf_counter()-t0:.1f}s")
-
+                while futures:
+                    completed, _ = wait(futures, timeout=1, return_when=FIRST_COMPLETED)
+                    if time.perf_counter() - t0 > 180:
+                        raise WeatherAPIError('전체 수집 대기시간 3분 초과: 분석 기간을 줄여 재시도하세요. 완료된 월 자료는 재사용됩니다.')
+                    for future in completed:
+                        start, end = futures.pop(future)
+                        try:
+                            all_combined.extend(future.result())
+                        except WeatherAPIError as error:
+                            raise WeatherAPIError(f'구간 수집 실패 {start}~{end} · {error}') from None
+                        except Exception:
+                            raise WeatherAPIError(f'구간 수집 실패 {start}~{end}: 기상청 연결·응답을 확인하고 재시도하세요.') from None
+                        done += 1
+                    update('기상청 응답 대기' if not completed else '수집 진행')
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+        except WeatherAPIError as error:
+            status.update(label='기상자료 수집 실패', state='error', expanded=True)
+            st.error(str(error))
+            raise
+        except Exception:
+            status.update(label='기상자료 수집 실패', state='error', expanded=True)
+            raise WeatherAPIError('첫 응답 확인 실패: 서비스 상태·분석 기간을 확인하고 재시도하세요.') from None
+        status.update(label=f'1/4 · 자료 수집 완료 · {len(all_combined):,}행', state='complete', expanded=False)
     if not all_combined:
-        return None, None, "수집된 데이터가 없습니다. 날짜·지점·API 키를 확인하세요."
-
+        return None, None, "조회 기간에 관측자료가 없습니다. 관측 시작일·지점·기간을 확인하세요."
     try:
         df_valid, df_invalid = prepare_observations(pd.DataFrame(all_combined), s_date, e_date)
     except ValueError:
@@ -984,7 +1035,7 @@ def _narr_stats(A, df, stn_name, chart_start, chart_end, primary_limit,
     col_sums = {c: float(ft[c].sum()) for c in noncalm}
     dom_bin = max(col_sums, key=col_sums.get) if sum(col_sums.values()) > 0 else '해당 관측 없음'
     dom_bin_short = dom_bin.split('(')[0].strip()
-    over20_pct = float(sum(ft[c].sum() for c in spd_cols if c.strip().startswith('>')))
+    over20_pct = float((ws_kt > 20).mean() * 100)
 
     best_angle = int(A['results'][primary_limit]['best_angle'])
     best_idx = best_angle // RWY_ANGLE_STEP_DEG
@@ -1746,6 +1797,7 @@ with row1_col2:
             primary_limit = auto_limit
 
 run_clicked = st.button("분석 시작", type="primary", use_container_width=True)
+st.caption('분석을 시작하면 아래에 1/4 자료 수집 → 2/4 분석 → 3/4 Excel → 4/4 DOCX 진행 상태가 표시됩니다. 오른쪽 위 Stop/멈추다는 실행 중지 버튼입니다.')
 
 st.divider()
 
@@ -1753,10 +1805,12 @@ st.divider()
 if run_clicked:
     if start_date > end_date or end_date >= date.today():
         st.error("시작일 ≤ 종료일이며 종료일은 어제까지여야 합니다.")
-        st.stop()
-    if (end_date - start_date).days > 366 * 30:
+        run_clicked = False
+    elif (end_date - start_date).days > 366 * 30:
         st.error("한 번에 최대 30년까지 분석할 수 있습니다.")
-        st.stop()
+        run_clicked = False
+
+if run_clicked:
     df = None
     row_count = None
     _chart_start = start_date
@@ -1769,13 +1823,16 @@ if run_clicked:
         else:
             try:
                 df, df_invalid_rows, result = get_weather_data_v28(api_key, stn_id, start_date, end_date)
+            except WeatherAPIError as error:
+                st.error(f"분석을 완료하지 못했습니다. {error}")
+                st.caption('오른쪽 위의 Stop/멈추다는 실행 중지 버튼입니다. 완료 표시가 아니며, 위 단계별 상태에서 진행·실패를 확인할 수 있습니다.')
             except Exception:
-                st.error("일부 기간 수집에 실패하여 분석을 중단했습니다. 인증키·호출 한도·네트워크를 확인한 뒤 재시도하세요.")
-                st.stop()
-            if df is None:
-                st.error(f"분석 실패: {result}")
+                st.error("기상자료 처리 중 오류가 발생했습니다. 기간·지점·서비스 상태를 확인한 뒤 재시도하세요.")
             else:
-                row_count = result
+                if df is None:
+                    st.error(f"분석 실패: {result}")
+                else:
+                    row_count = result
     else:
         # AWS CSV 업로드 경로
         if not aws_files:
@@ -1787,332 +1844,351 @@ if run_clicked:
             else:
                 row_count = result
 
-    # ── 분석 & 표시 (ASOS / AWS 공통) ───────────────────────────
     if df is not None:
-        quality = coverage_summary(df, _chart_start, _chart_end)
-        st.caption(f"선택 기간 기대 관측시간 {quality['expected']:,} h · 유효 확보율 {quality['percent']:.2f}% · 미확보 {quality['missing']:,} h")
-        if quality['missing']:
-            st.warning("선택 기간에 미확보 또는 제외된 시간이 있습니다. 이용률의 분모는 확보된 유효 관측이며, 결측시간을 이용 가능으로 가정하지 않습니다.")
-        st.caption("방위각은 관측 풍향과 동일한 기준입니다. 자기편각을 적용하지 않았으므로 활주로 번호는 참고용 가칭입니다. 평균·최대 측풍은 3 kt 초과 관측 기준입니다.")
+        try:
+            with st.status('2/4 · 관측자료 검증 및 활주로 이용률 계산', expanded=True) as status:
+                st.write(f'유효 자료 {len(df):,}행으로 측풍·바람장미·복수 활주로 조합을 계산합니다.')
+                A = analyze_runway(df)
+                status.update(label='2/4 · 분석 완료', state='complete', expanded=False)
+            with st.status('3/4 · Excel 품질 보고서 생성', expanded=True) as status:
+                excel_bytes = _build_quality_excel(df, df_invalid_rows)
+                status.update(label='3/4 · Excel 준비 완료', state='complete', expanded=False)
+        except Exception:
+            st.error('분석 또는 Excel 생성에 실패했습니다. 입력 자료를 확인해 재시도하세요. 이전에 완료한 결과가 있으면 아래에 유지됩니다.')
+            df = None
+        if df is not None:
+            docx_bytes = None
+            with st.status('4/4 · DOCX 검토서와 차트 생성', expanded=True) as status:
+                st.write('차트를 그려 검토서에 넣고 있습니다. 데이터 수집이 끝나도 파일 생성에 시간이 필요할 수 있습니다.')
+                try:
+                    n_invalid = len(df_invalid_rows) if df_invalid_rows is not None else 0
+                    docx_bytes = build_review_docx(A, df, stn_name, _chart_start, _chart_end,
+                                                   primary_limit, len(df) + n_invalid, len(df), n_invalid)
+                except Exception:
+                    status.update(label='4/4 · DOCX 생성 실패 (분석 결과·Excel 유지)', state='error', expanded=True)
+                else:
+                    status.update(label='4/4 · DOCX 준비 완료', state='complete', expanded=False)
+            st.session_state['analysis_result'] = {
+                'df': df, 'invalid': df_invalid_rows, 'analysis': A, 'station_name': stn_name,
+                'start': _chart_start, 'end': _chart_end, 'limit': primary_limit,
+                'excel_bytes': excel_bytes, 'docx_bytes': docx_bytes,
+                'completed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
 
-        _period_months = (
-            (_chart_end.year - _chart_start.year) * 12
-            + (_chart_end.month - _chart_start.month) + 1
-        )
-        st.success(
-            f"{stn_name} · {row_count:,}시간 수집 완료 "
-            f"· 선택 분석 기간: **{_chart_start:%Y-%m-%d} ~ {_chart_end:%Y-%m-%d}** "
-            f"({_period_months}개월)"
-        )
-        with st.spinner("바람성분 vector 분석 중..."):
-            A = analyze_runway(df)
+snapshot = st.session_state.get('analysis_result')
+if snapshot:
+    df, df_invalid_rows, A = snapshot['df'], snapshot['invalid'], snapshot['analysis']
+    stn_name, _chart_start, _chart_end = snapshot['station_name'], snapshot['start'], snapshot['end']
+    primary_limit, row_count = snapshot['limit'], len(df)
+    st.caption(f"최근 완료한 분석 결과 · {snapshot['completed_at']} · 위 설정을 바꾼 뒤에는 ‘분석 시작’을 눌러 새 결과를 생성하세요.")
+    quality = coverage_summary(df, _chart_start, _chart_end)
+    st.caption(f"선택 기간 기대 관측시간 {quality['expected']:,} h · 유효 확보율 {quality['percent']:.2f}% · 미확보 {quality['missing']:,} h")
+    if quality['missing']:
+        st.warning("선택 기간에 미확보 또는 제외된 시간이 있습니다. 이용률의 분모는 확보된 유효 관측이며, 결측시간을 이용 가능으로 가정하지 않습니다.")
+    st.caption("방위각은 관측 풍향과 동일한 기준입니다. 자기편각을 적용하지 않았으므로 활주로 번호는 참고용 가칭입니다. 평균·최대 측풍은 3 kt 초과 관측 기준입니다.")
 
-            # --- 데이터 요약 ---
-            st.divider()
-            s0, s1, s2, s3, s4 = st.columns(5)
-            s0.metric("분석 기간", f"{_chart_start:%Y-%m}", f"~ {_chart_end:%Y-%m}")
-            s1.metric("전체 관측 시간", f"{A['N_total']:,} h")
-            s2.metric(f"Calm (0~{fmt_kt(CALM_THRESHOLD_KT)})", f"{A['N_calm']:,} h", f"{A['calm_pct']:.2f}%")
-            s3.metric("유효 데이터", f"{A['N_eff']:,} h")
-            s4.metric("적용 측풍 허용치", fmt_kt(primary_limit))
-            st.caption("※ Calm(무영향) 데이터는 논문 §3.2에 따라 활주로 방향 무관하게 '이용 가능'으로 집계됩니다.")
+    _period_months = (
+        (_chart_end.year - _chart_start.year) * 12
+        + (_chart_end.month - _chart_start.month) + 1
+    )
+    st.success(
+        f"{stn_name} · {row_count:,}시간 수집 완료 "
+        f"· 선택 분석 기간: **{_chart_start:%Y-%m-%d} ~ {_chart_end:%Y-%m-%d}** "
+        f"({_period_months}개월)"
+    )
+    with st.container():
 
-            # --- 주 결과(자동/수동 선택된 한계치) ---
-            st.subheader(f"분석 결과 · 허용치 {fmt_kt(primary_limit)}")
-            r = A['results'][primary_limit]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("최적 활주로", rwy_name(r['best_angle']), f"{r['best_angle']}°")
-            c2.metric("선정 방향 이용률", f"{r['best_usab']:.3f}%",
-                      "PASS" if r['pass'] else "FAIL")
-            c3.metric("평균 측풍", f"{r['mean_xwind']:.2f} kt", f"{_kt2ms(r['mean_xwind']):.2f} m/s", delta_color="off")
-            c4.metric("동율 후보", f"{r['tied_count']}개",
-                      "동율 처리 적용" if r['tied_count'] > 1 else "유일")
+        # --- 데이터 요약 ---
+        st.divider()
+        s0, s1, s2, s3, s4 = st.columns(5)
+        s0.metric("분석 기간", f"{_chart_start:%Y-%m}", f"~ {_chart_end:%Y-%m}")
+        s1.metric("전체 관측 시간", f"{A['N_total']:,} h")
+        s2.metric(f"Calm (0~{fmt_kt(CALM_THRESHOLD_KT)})", f"{A['N_calm']:,} h", f"{A['calm_pct']:.2f}%")
+        s3.metric("유효 데이터", f"{A['N_eff']:,} h")
+        s4.metric("적용 측풍 허용치", fmt_kt(primary_limit))
+        st.caption("※ Calm(무영향) 데이터는 논문 §3.2에 따라 활주로 방향 무관하게 '이용 가능'으로 집계됩니다.")
 
-            if not r['pass']:
-                st.warning(
-                    f"단일 활주로로 95% 미달. 2개 활주로 최적 조합: "
-                    f"**{rwy_name(r['pair_angles'][0])} + {rwy_name(r['pair_angles'][1])}** "
-                    f"→ 이용률 **{r['pair_usab']:.3f}%** "
-                    f"{'PASS' if r['pair_pass'] else '여전히 FAIL'}"
-                )
+        # --- 주 결과(자동/수동 선택된 한계치) ---
+        st.subheader(f"분석 결과 · 허용치 {fmt_kt(primary_limit)}")
+        r = A['results'][primary_limit]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("최적 활주로", rwy_name(r['best_angle']), f"{r['best_angle']}°")
+        c2.metric("선정 방향 이용률", f"{r['best_usab']:.3f}%",
+                  "PASS" if r['pass'] else "FAIL")
+        c3.metric("평균 측풍", f"{r['mean_xwind']:.2f} kt", f"{_kt2ms(r['mean_xwind']):.2f} m/s", delta_color="off")
+        c4.metric("동율 후보", f"{r['tied_count']}개",
+                  "동율 처리 적용" if r['tied_count'] > 1 else "유일")
 
-            # --- 탭 ---
-            t1, t2, t3, t4, t5, t6 = st.tabs([
-                "3개 허용치 종합", "이용률 곡선", "바람장미",
-                "16방위 빈도표", "2개 활주로 분석", "방위각 상세표"
-            ])
+        if not r['pass']:
+            st.warning(
+                f"단일 활주로로 95% 미달. 2개 활주로 최적 조합: "
+                f"**{rwy_name(r['pair_angles'][0])} + {rwy_name(r['pair_angles'][1])}** "
+                f"→ 이용률 **{r['pair_usab']:.3f}%** "
+                f"{'PASS' if r['pair_pass'] else '여전히 FAIL'}"
+            )
 
-            with t1:
-                st.markdown("#### ICAO Doc. 9157 세 개 측풍 한계치 동시 분석")
-                summary_rows = []
-                for lim in CROSSWIND_LIMITS_KT:
-                    rr = A['results'][lim]
-                    summary_rows.append({
-                        "허용치": fmt_kt(lim),
-                        "최적 활주로": rwy_name(rr['best_angle']),
-                        "방위각 (°)": rr['best_angle'],
-                        "이용률 (%)": round(rr['best_usab'], 3),
-                        "평균 측풍 (kt)": round(rr['mean_xwind'], 2),
-                        "평균 측풍 (m/s)": round(_kt2ms(rr['mean_xwind']), 2),
-                        "최대 측풍 (kt)": round(rr['max_xwind'], 2),
-                        "최대 측풍 (m/s)": round(_kt2ms(rr['max_xwind']), 2),
-                        "동율 후보수": rr['tied_count'],
-                        "단일 판정": "PASS" if rr['pass'] else "FAIL",
-                        "2개 조합 이용률 (%)": round(rr['pair_usab'], 3),
-                        "2개 조합": f"{rwy_name(rr['pair_angles'][0])} + {rwy_name(rr['pair_angles'][1])}",
-                    })
-                st.dataframe(pd.DataFrame(summary_rows), width='stretch', hide_index=True)
+        # --- 탭 ---
+        t1, t2, t3, t4, t5, t6 = st.tabs([
+            "3개 허용치 종합", "이용률 곡선", "바람장미",
+            "16방위 빈도표", "2개 활주로 분석", "방위각 상세표"
+        ])
 
-            with t2:
-                curve_df = pd.DataFrame({
-                    "angle": np.tile(A['angles'], len(CROSSWIND_LIMITS_KT)),
-                    "usability": np.concatenate([A['results'][l]['usability'] for l in CROSSWIND_LIMITS_KT]),
-                    "limit_kt": np.repeat([fmt_kt(l) for l in CROSSWIND_LIMITS_KT], len(A['angles'])),
+        with t1:
+            st.markdown("#### ICAO Doc. 9157 세 개 측풍 한계치 동시 분석")
+            summary_rows = []
+            for lim in CROSSWIND_LIMITS_KT:
+                rr = A['results'][lim]
+                summary_rows.append({
+                    "허용치": fmt_kt(lim),
+                    "최적 활주로": rwy_name(rr['best_angle']),
+                    "방위각 (°)": rr['best_angle'],
+                    "이용률 (%)": round(rr['best_usab'], 3),
+                    "평균 측풍 (kt)": round(rr['mean_xwind'], 2),
+                    "평균 측풍 (m/s)": round(_kt2ms(rr['mean_xwind']), 2),
+                    "최대 측풍 (kt)": round(rr['max_xwind'], 2),
+                    "최대 측풍 (m/s)": round(_kt2ms(rr['max_xwind']), 2),
+                    "동율 후보수": rr['tied_count'],
+                    "단일 판정": "PASS" if rr['pass'] else "FAIL",
+                    "2개 조합 이용률 (%)": round(rr['pair_usab'], 3),
+                    "2개 조합": f"{rwy_name(rr['pair_angles'][0])} + {rwy_name(rr['pair_angles'][1])}",
                 })
-                fig1 = px.line(curve_df, x="angle", y="usability", color="limit_kt",
-                               title="방향별 이용률 (허용치별 비교)",
-                               labels={"angle": "활주로 방위각 (°)", "usability": "이용률 (%)", "limit_kt": "허용치"})
-                fig1.add_hline(y=USABILITY_TARGET, line_dash="dash", line_color="red",
-                               annotation_text="ICAO 95%", annotation_position="top right")
-                for lim in CROSSWIND_LIMITS_KT:
-                    rr = A['results'][lim]
-                    fig1.add_vline(x=rr['best_angle'], line_dash="dot", opacity=0.3)
-                st.plotly_chart(fig1, width='stretch')
+            st.dataframe(pd.DataFrame(summary_rows), width='stretch', hide_index=True)
 
-            with t3:
-                # ── 바람장미 집계: 16방위 × 6풍속구간 → 빈도(%) ──────────
-                _wd_r  = df['wd'].to_numpy(dtype=np.float32)
-                _ws_r  = df['ws_kt'].to_numpy(dtype=np.float32)
-                _N_r   = len(_wd_r)
+        with t2:
+            curve_df = pd.DataFrame({
+                "angle": np.tile(A['angles'], len(CROSSWIND_LIMITS_KT)),
+                "usability": np.concatenate([A['results'][l]['usability'] for l in CROSSWIND_LIMITS_KT]),
+                "limit_kt": np.repeat([fmt_kt(l) for l in CROSSWIND_LIMITS_KT], len(A['angles'])),
+            })
+            fig1 = px.line(curve_df, x="angle", y="usability", color="limit_kt",
+                           title="방향별 이용률 (허용치별 비교)",
+                           labels={"angle": "활주로 방위각 (°)", "usability": "이용률 (%)", "limit_kt": "허용치"})
+            fig1.add_hline(y=USABILITY_TARGET, line_dash="dash", line_color="red",
+                           annotation_text="ICAO 95%", annotation_position="top right")
+            for lim in CROSSWIND_LIMITS_KT:
+                rr = A['results'][lim]
+                fig1.add_vline(x=rr['best_angle'], line_dash="dot", opacity=0.3)
+            st.plotly_chart(fig1, width='stretch')
 
-                # Calm(정온) 분리 — 0.5 m/s 이하 (바람장미 전용 기준, 활주로 측풍분석의
-                # CALM_THRESHOLD_KT=3kt와는 별개). 0.5 m/s → 0.5*1.94384 ≈ 0.97 kt
-                _CALM_ROSE_KT = 0.5 * 1.94384
-                _calm_rose_mask = _ws_r <= _CALM_ROSE_KT
-                _calm_rose_pct  = float(_calm_rose_mask.sum()) / _N_r * 100.0
+        with t3:
+            # ── 바람장미 집계: 16방위 × 6풍속구간 → 빈도(%) ──────────
+            _wd_r  = df['wd'].to_numpy(dtype=np.float32)
+            _ws_r  = df['ws_kt'].to_numpy(dtype=np.float32)
+            _N_r   = len(_wd_r)
 
-                # 16방위 bin (22.5° 간격, N=0°) — Calm 제외한 유효바람만 방향 집계
-                _dir_ang  = np.arange(0, 360, 22.5)                    # [0, 22.5 … 337.5]
-                _wd_eff   = _wd_r[~_calm_rose_mask]
-                _ws_eff   = _ws_r[~_calm_rose_mask]
-                _dir_idx  = ((((_wd_eff + 11.25) // 22.5) % 16)).astype(np.int32)
+            # Calm(정온) 분리 — 0.5 m/s 이하 (바람장미 전용 기준, 활주로 측풍분석의
+            # CALM_THRESHOLD_KT=3kt와는 별개). 0.5 m/s → 0.5*1.94384 ≈ 0.97 kt
+            _CALM_ROSE_KT = 0.5 * 1.94384
+            _calm_rose_mask = _ws_r <= _CALM_ROSE_KT
+            _calm_rose_pct  = float(_calm_rose_mask.sum()) / _N_r * 100.0
 
-                # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21 — m/s 동시 표기
-                _spd_thresh = [3, 7, 11, 17, 21]                        # 오름차순 경계값
-                _spd_labels = [
-                    f"0–3 kt (0–{_kt2ms(3):.1f} m/s)",
-                    f"3–7 kt ({_kt2ms(3):.1f}–{_kt2ms(7):.1f} m/s)",
-                    f"7–11 kt ({_kt2ms(7):.1f}–{_kt2ms(11):.1f} m/s)",
-                    f"11–17 kt ({_kt2ms(11):.1f}–{_kt2ms(17):.1f} m/s)",
-                    f"17–21 kt ({_kt2ms(17):.1f}–{_kt2ms(21):.1f} m/s)",
-                    f">21 kt (>{_kt2ms(21):.1f} m/s)",
-                ]
-                _spd_idx = np.zeros(len(_ws_eff), dtype=np.int32)
-                for _i, _t in enumerate(_spd_thresh):
-                    _spd_idx[_ws_eff > _t] = _i + 1                    # 초과(>) 기준 bin 배정
+            # 16방위 bin (22.5° 간격, N=0°) — Calm 제외한 유효바람만 방향 집계
+            _dir_ang  = np.arange(0, 360, 22.5)                    # [0, 22.5 … 337.5]
+            _wd_eff   = _wd_r[~_calm_rose_mask]
+            _ws_eff   = _ws_r[~_calm_rose_mask]
+            _dir_idx  = ((((_wd_eff + 11.25) // 22.5) % 16)).astype(np.int32)
 
-                # 집계 (16 × 6) → 전체 관측(Calm 포함) 대비 % → 막대 합 + Calm% = 100%
-                _rose_cnt = np.bincount(_dir_idx * 6 + _spd_idx, minlength=96).reshape(16, 6)
-                _df_rose = pd.DataFrame({
-                    'angle':     np.repeat(_dir_ang, 6),
-                    'speed_bin': np.tile(_spd_labels, 16),
-                    'freq_pct':  _rose_cnt.ravel() / _N_r * 100.0,
-                })
+            # 풍속 구간 6단계 (kt): (0,3], (3,7], … >21 — m/s 동시 표기
+            _spd_thresh = [3, 7, 11, 17, 21]                        # 오름차순 경계값
+            _spd_labels = [
+                f"0–3 kt (0–{_kt2ms(3):.1f} m/s)",
+                f"3–7 kt ({_kt2ms(3):.1f}–{_kt2ms(7):.1f} m/s)",
+                f"7–11 kt ({_kt2ms(7):.1f}–{_kt2ms(11):.1f} m/s)",
+                f"11–17 kt ({_kt2ms(11):.1f}–{_kt2ms(17):.1f} m/s)",
+                f"17–21 kt ({_kt2ms(17):.1f}–{_kt2ms(21):.1f} m/s)",
+                f">21 kt (>{_kt2ms(21):.1f} m/s)",
+            ]
+            _spd_idx = np.zeros(len(_ws_eff), dtype=np.int32)
+            for _i, _t in enumerate(_spd_thresh):
+                _spd_idx[_ws_eff > _t] = _i + 1                    # 초과(>) 기준 bin 배정
 
-                # 이산 색상 (오름차순: 연한색 → 진한색)
-                _color_seq = ["#c6dbef", "#74c476", "#fdd835", "#fd8d3c", "#e31a1c", "#67000d"]
-                _color_map = dict(zip(_spd_labels, _color_seq))
+            # 집계 (16 × 6) → 전체 관측(Calm 포함) 대비 % → 막대 합 + Calm% = 100%
+            _rose_cnt = np.bincount(_dir_idx * 6 + _spd_idx, minlength=96).reshape(16, 6)
+            _df_rose = pd.DataFrame({
+                'angle':     np.repeat(_dir_ang, 6),
+                'speed_bin': np.tile(_spd_labels, 16),
+                'freq_pct':  _rose_cnt.ravel() / _N_r * 100.0,
+            })
 
-                fig2 = px.bar_polar(
-                    _df_rose,
-                    r="freq_pct",
-                    theta="angle",
-                    color="speed_bin",
-                    color_discrete_map=_color_map,
-                    category_orders={"speed_bin": _spd_labels},
-                    title=f"Wind Rose — {stn_name}  ({_chart_start:%Y-%m} ~ {_chart_end:%Y-%m})",
-                    template="plotly_white",
-                )
-                _polar_domain = dict(x=[0.0, 0.74], y=[0.0, 1.0])      # 우측은 범례 공간
-                fig2.update_layout(
-                    polar=dict(
-                        domain=_polar_domain,
-                        hole=0.16,             # 중앙에 Calm 표시용 빈 원
-                        angularaxis=dict(
-                            tickmode="array",
-                            tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
-                            ticktext=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
-                            direction="clockwise",
-                            rotation=90,           # N을 12시 방향으로
-                        ),
-                        radialaxis=dict(
-                            ticksuffix="%",        # 반경 축 단위 (%)
-                            angle=45,              # 눈금 레이블 겹침 방지
-                            tickangle=45,
-                        ),
+            # 이산 색상 (오름차순: 연한색 → 진한색)
+            _color_seq = ["#c6dbef", "#74c476", "#fdd835", "#fd8d3c", "#e31a1c", "#67000d"]
+            _color_map = dict(zip(_spd_labels, _color_seq))
+
+            fig2 = px.bar_polar(
+                _df_rose,
+                r="freq_pct",
+                theta="angle",
+                color="speed_bin",
+                color_discrete_map=_color_map,
+                category_orders={"speed_bin": _spd_labels},
+                title=f"Wind Rose — {stn_name}  ({_chart_start:%Y-%m} ~ {_chart_end:%Y-%m})",
+                template="plotly_white",
+            )
+            _polar_domain = dict(x=[0.0, 0.74], y=[0.0, 1.0])      # 우측은 범례 공간
+            fig2.update_layout(
+                polar=dict(
+                    domain=_polar_domain,
+                    hole=0.16,             # 중앙에 Calm 표시용 빈 원
+                    angularaxis=dict(
+                        tickmode="array",
+                        tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                        ticktext=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+                        direction="clockwise",
+                        rotation=90,           # N을 12시 방향으로
                     ),
-                    legend=dict(title="풍속 구간", traceorder="normal"),
-                    margin=dict(t=60, b=30, l=30, r=30),
-                    height=540,
-                )
-                fig2.add_annotation(
-                    text=f"Calm<br>{_calm_rose_pct:.1f}%",
-                    x=(_polar_domain['x'][0] + _polar_domain['x'][1]) / 2,
-                    y=(_polar_domain['y'][0] + _polar_domain['y'][1]) / 2,
-                    xref="paper", yref="paper",
-                    showarrow=False,
-                    font=dict(size=14, color="#333"),
-                    align="center",
-                )
-                st.plotly_chart(fig2, width='stretch')
-                st.caption(f"중앙 원: 풍속 0.5 m/s(≈{_CALM_ROSE_KT:.2f} kt) 이하 정온(Calm) 비율 · "
-                           f"방위별 막대는 Calm을 제외한 유효바람 기준 (막대 합 + Calm = 100%)")
+                    radialaxis=dict(
+                        ticksuffix="%",        # 반경 축 단위 (%)
+                        angle=45,              # 눈금 레이블 겹침 방지
+                        tickangle=45,
+                    ),
+                ),
+                legend=dict(title="풍속 구간", traceorder="normal"),
+                margin=dict(t=60, b=30, l=30, r=30),
+                height=540,
+            )
+            fig2.add_annotation(
+                text=f"Calm<br>{_calm_rose_pct:.1f}%",
+                x=(_polar_domain['x'][0] + _polar_domain['x'][1]) / 2,
+                y=(_polar_domain['y'][0] + _polar_domain['y'][1]) / 2,
+                xref="paper", yref="paper",
+                showarrow=False,
+                font=dict(size=14, color="#333"),
+                align="center",
+            )
+            st.plotly_chart(fig2, width='stretch')
+            st.caption(f"중앙 원: 풍속 0.5 m/s(≈{_CALM_ROSE_KT:.2f} kt) 이하 정온(Calm) 비율 · "
+                       f"방위별 막대는 Calm을 제외한 유효바람 기준 (막대 합 + Calm = 100%)")
 
-            with t4:
-                st.markdown("#### 16방위 × 풍속구간 빈도표 (%) — 논문 Table 6 양식")
-                st.dataframe(A['freq_table'], width='stretch')
-                st.caption(f"합계 100% 기준 · Calm(0~{fmt_kt(CALM_THRESHOLD_KT)}) 비율: {A['calm_pct']:.2f}%")
+        with t4:
+            st.markdown("#### 16방위 × 풍속구간 빈도표 (%) — 논문 Table 6 양식")
+            st.dataframe(A['freq_table'], width='stretch')
+            st.caption(f"합계 100% 기준 · Calm(0~{fmt_kt(CALM_THRESHOLD_KT)}) 비율: {A['calm_pct']:.2f}%")
 
-            with t5:
-                st.markdown(f"#### 2개 활주로 최적 조합 (허용치 {fmt_kt(primary_limit)})")
-                st.caption(f"※ 최소 각도 분리 {MIN_SEPARATION_DEG}° 제약 적용 "
-                           f"(물리적 배치 가능성 고려)")
-                r = A['results'][primary_limit]
-                p1, p2 = r['pair_angles']
-                d1, d2, d3 = st.columns(3)
-                d1.metric("1차 활주로", rwy_name(p1), f"{p1}°")
-                d2.metric("2차 활주로", rwy_name(p2), f"{p2}°")
-                d3.metric("조합 이용률", f"{r['pair_usab']:.3f}%",
-                          "PASS" if r['pair_pass'] else "FAIL")
-                st.info(
-                    f"공동 선정 단일 활주로 이용률: **{r['best_usab']:.3f}%** → "
-                    f"2개 조합 이용률: **{r['pair_usab']:.3f}%** "
-                    f"(차이 {r['pair_usab']-r['best_usab']:+.3f}%p)"
-                )
+        with t5:
+            st.markdown(f"#### 2개 활주로 최적 조합 (허용치 {fmt_kt(primary_limit)})")
+            st.caption(f"※ 최소 각도 분리 {MIN_SEPARATION_DEG}° 제약 적용 "
+                       f"(물리적 배치 가능성 고려)")
+            r = A['results'][primary_limit]
+            p1, p2 = r['pair_angles']
+            d1, d2, d3 = st.columns(3)
+            d1.metric("1차 활주로", rwy_name(p1), f"{p1}°")
+            d2.metric("2차 활주로", rwy_name(p2), f"{p2}°")
+            d3.metric("조합 이용률", f"{r['pair_usab']:.3f}%",
+                      "PASS" if r['pair_pass'] else "FAIL")
+            st.info(
+                f"공동 선정 단일 활주로 이용률: **{r['best_usab']:.3f}%** → "
+                f"2개 조합 이용률: **{r['pair_usab']:.3f}%** "
+                f"(차이 {r['pair_usab']-r['best_usab']:+.3f}%p)"
+            )
 
-            with t6:
-                st.markdown("#### 방위각 간격별 이용률 상세표 (10° 간격)")
-                st.caption(
-                    "각 행은 활주로 방위(방향 ↔ 대응방향) 쌍이며, 허용측풍별 이용률(%)을 나타냅니다. "
-                    "95% 미달은 빨강, 이상은 초록으로 강조됩니다. "
-                    "(10° 분석 격자이며 격자 사이 방향은 탐색하지 않습니다.)"
-                )
+        with t6:
+            st.markdown("#### 방위각 간격별 이용률 상세표 (10° 간격)")
+            st.caption(
+                "각 행은 활주로 방위(방향 ↔ 대응방향) 쌍이며, 허용측풍별 이용률(%)을 나타냅니다. "
+                "95% 미달은 빨강, 이상은 초록으로 강조됩니다. "
+                "(10° 분석 격자이며 격자 사이 방향은 탐색하지 않습니다.)"
+            )
 
-                headings = np.arange(RWY_ANGLE_STEP_DEG, 181, RWY_ANGLE_STEP_DEG, dtype=int)  # 10,20,...,180
-                rows = []
-                for h in headings:
-                    i = int(h % 180)                               # 180° ≡ 0° (동일 활주로)
-                    idx = i // RWY_ANGLE_STEP_DEG                  # usability 배열 인덱스 (10° 격자)
-                    rec = int(h + 180)                              # 10→190, ..., 180→360
-                    row = {
-                        "방향 (°)": int(h),
-                        "대응방향 (°)": rec,
-                        "활주로": rwy_name(i),
-                    }
-                    for lim in CROSSWIND_LIMITS_KT:
-                        row[f"{fmt_kt(lim)} 이용률 (%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
-                    rows.append(row)
-                df_table = pd.DataFrame(rows)
-
-                # 95% 기준 색상 강조 (pandas 3.x: Styler.map 사용)
-                kt_cols = [c for c in df_table.columns if "이용률" in c]
-                def _hl(v):
-                    if isinstance(v, (int, float)):
-                        if v >= USABILITY_TARGET:
-                            return "background-color: #d4edda; color: #155724;"
-                        return "background-color: #f8d7da; color: #721c24;"
-                    return ""
-                styled = df_table.style.map(_hl, subset=kt_cols).format({c: "{:.2f}" for c in kt_cols})
-                st.dataframe(styled, width='stretch', hide_index=True)
-
-                # 최적 방향 요약
-                st.markdown("##### 허용치별 개별 최대 방위각 (결합 기준 선정과 별도)")
-                best_rows = []
+            headings = np.arange(RWY_ANGLE_STEP_DEG, 181, RWY_ANGLE_STEP_DEG, dtype=int)  # 10,20,...,180
+            rows = []
+            for h in headings:
+                i = int(h % 180)                               # 180° ≡ 0° (동일 활주로)
+                idx = i // RWY_ANGLE_STEP_DEG                  # usability 배열 인덱스 (10° 격자)
+                rec = int(h + 180)                              # 10→190, ..., 180→360
+                row = {
+                    "방향 (°)": int(h),
+                    "대응방향 (°)": rec,
+                    "활주로": rwy_name(i),
+                }
                 for lim in CROSSWIND_LIMITS_KT:
-                    col = f"{fmt_kt(lim)} 이용률 (%)"
-                    sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", col]]
-                    top = sub.loc[sub[col].idxmax()]
-                    best_rows.append({
-                        "허용치": fmt_kt(lim),
-                        "개별 최대 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
-                        "활주로": top['활주로'],
-                        "이용률 (%)": f"{top[col]:.2f}",
-                        "판정": "PASS" if top[col] >= USABILITY_TARGET else "FAIL",
-                    })
-                st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
+                    row[f"{fmt_kt(lim)} 이용률 (%)"] = round(float(A['results'][lim]['usability'][idx]), 2)
+                rows.append(row)
+            df_table = pd.DataFrame(rows)
 
-                # CSV 다운로드
-                csv_bytes = df_table.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-                st.download_button(
-                    "CSV 다운로드",
-                    csv_bytes,
-                    on_click="ignore",
-                    file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step10.csv",
-                    mime="text/csv",
-                    key="dl_detail_csv",
-                )
+            # 95% 기준 색상 강조 (pandas 3.x: Styler.map 사용)
+            kt_cols = [c for c in df_table.columns if "이용률" in c]
+            def _hl(v):
+                if isinstance(v, (int, float)):
+                    if v >= USABILITY_TARGET:
+                        return "background-color: #d4edda; color: #155724;"
+                    return "background-color: #f8d7da; color: #721c24;"
+                return ""
+            styled = df_table.style.map(_hl, subset=kt_cols).format({c: "{:.2f}" for c in kt_cols})
+            st.dataframe(styled, width='stretch', hide_index=True)
 
-            # ── 데이터 품질 검토 ───────────────────────────────────────
-            st.divider()
-            st.subheader("데이터 품질 검토")
+            # 최적 방향 요약
+            st.markdown("##### 허용치별 개별 최대 방위각 (결합 기준 선정과 별도)")
+            best_rows = []
+            for lim in CROSSWIND_LIMITS_KT:
+                col = f"{fmt_kt(lim)} 이용률 (%)"
+                sub = df_table[["방향 (°)", "대응방향 (°)", "활주로", col]]
+                top = sub.loc[sub[col].idxmax()]
+                best_rows.append({
+                    "허용치": fmt_kt(lim),
+                    "개별 최대 방향": f"{int(top['방향 (°)'])}° / {int(top['대응방향 (°)'])}°",
+                    "활주로": top['활주로'],
+                    "이용률 (%)": f"{top[col]:.2f}",
+                    "판정": "PASS" if top[col] >= USABILITY_TARGET else "FAIL",
+                })
+            st.dataframe(pd.DataFrame(best_rows), width='stretch', hide_index=True)
 
-            _n_valid   = A['N_total']
-            _n_invalid = len(df_invalid_rows) if df_invalid_rows is not None else 0
-            _n_raw     = _n_valid + _n_invalid
-            _valid_pct = _n_valid   / _n_raw * 100 if _n_raw > 0 else 0
-            _miss_pct  = _n_invalid / _n_raw * 100 if _n_raw > 0 else 0
-
-            qa1, qa2, qa3 = st.columns(3)
-            qa1.metric("전체 수집 행",          f"{_n_raw:,} 행")
-            qa2.metric("유효 시간자료", f"{_n_valid:,} 행",   f"{_valid_pct:.1f}%")
-            qa3.metric("제외 자료 (결측·오류·중복)", f"{_n_invalid:,} 행", f"{_miss_pct:.1f}%")
-
-            st.caption(
-                "**유효**: 정시·단일 지점·정상 범위·품질검사를 통과한 고유 관측  \n"
-                "**제외**: 결측·범위 오류·품질 플래그·중복·시각 오류 (Excel 제외사유 참조)"
-            )
-
-            # Excel 2-시트 다운로드 (유효 / 결측) — 생성 결과는 캐시됨
-            _excel_bytes = _build_quality_excel(df, df_invalid_rows)
-
+            # CSV 다운로드
+            csv_bytes = df_table.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
             st.download_button(
-                "데이터 품질 보고서 다운로드 (Excel)",
-                _excel_bytes,
+                "CSV 다운로드",
+                csv_bytes,
                 on_click="ignore",
-                file_name=f"data_quality_{stn_name}_{_chart_start}_{_chart_end}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                file_name=f"runway_usability_{stn_name}_{_chart_start}_{_chart_end}_step10.csv",
+                mime="text/csv",
+                key="dl_detail_csv",
             )
 
-            # ── 검토서(Word) 생성 ─────────────────────────────────────────
-            # 분석과 같은 실행에서 미리 생성해 download_button으로 직접 제공한다.
-            # (별도 st.button은 클릭 시 rerun을 일으키는데, 결과 표시가 `if run_clicked`
-            #  블록 안에 있어 rerun 시 run_clicked=False가 되며 화면 전체가 초기화되어
-            #  아무 동작도 하지 않는 문제가 있었음. Excel 다운로드와 동일한 패턴으로 통일.)
-            st.divider()
-            st.subheader("활주로 방향 검토서 생성")
-            st.caption(
-                "분석 결과를 ICAO 기준 검토서(.docx)로 내보냅니다. 바람장미·이용률 곡선·"
-                "빈도표·상세표가 자동 삽입되며, 개요·결론 등 서술 항목([ 작성 ] 표시)은 "
-                "생성 후 Word/HWP에서 직접 작성하면 됩니다."
+        # ── 데이터 품질 검토 ───────────────────────────────────────
+        st.divider()
+        st.subheader("데이터 품질 검토")
+
+        _n_valid   = A['N_total']
+        _n_invalid = len(df_invalid_rows) if df_invalid_rows is not None else 0
+        _n_raw     = _n_valid + _n_invalid
+        _valid_pct = _n_valid   / _n_raw * 100 if _n_raw > 0 else 0
+        _miss_pct  = _n_invalid / _n_raw * 100 if _n_raw > 0 else 0
+
+        qa1, qa2, qa3 = st.columns(3)
+        qa1.metric("전체 수집 행",          f"{_n_raw:,} 행")
+        qa2.metric("유효 시간자료", f"{_n_valid:,} 행",   f"{_valid_pct:.1f}%")
+        qa3.metric("제외 자료 (결측·오류·중복)", f"{_n_invalid:,} 행", f"{_miss_pct:.1f}%")
+
+        st.caption(
+            "**유효**: 정시·단일 지점·정상 범위·품질검사를 통과한 고유 관측  \n"
+            "**제외**: 결측·범위 오류·품질 플래그·중복·시각 오류 (Excel 제외사유 참조)"
+        )
+
+        # Excel 2-시트 다운로드 (유효 / 결측) — 생성 결과는 캐시됨
+        _excel_bytes = snapshot['excel_bytes']
+
+        st.download_button(
+            "데이터 품질 보고서 다운로드 (Excel)",
+            _excel_bytes,
+            on_click="ignore",
+            file_name=f"data_quality_{stn_name}_{_chart_start}_{_chart_end}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+            # ── 검토서(Word) 다운로드 ─────────────────────────────────────
+        st.divider()
+        st.subheader("활주로 방향 검토서 생성")
+        st.caption(
+            "분석 결과를 ICAO 기준 검토서(.docx)로 내보냅니다. 바람장미·이용률 곡선·"
+            "빈도표·상세표가 자동 삽입되며, 개요·결론 등 서술 항목([ 작성 ] 표시)은 "
+            "생성 후 Word/HWP에서 직접 작성하면 됩니다."
+        )
+        if snapshot['docx_bytes'] is not None:
+            st.download_button(
+                "검토서 다운로드 (.docx)", snapshot['docx_bytes'], on_click="ignore",
+                file_name=f"활주로방향검토서_{stn_name}_{_chart_start}_{_chart_end}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_review_docx",
             )
-            try:
-                with st.spinner("검토서 작성 중 (차트 렌더링 포함)..."):
-                    _review_docx = build_review_docx(
-                        A, df, stn_name, _chart_start, _chart_end, primary_limit,
-                        _n_raw, _n_valid, _n_invalid,
-                    )
-                st.download_button(
-                    "검토서 다운로드 (.docx)",
-                    _review_docx,
-                    on_click="ignore",
-                    file_name=f"활주로방향검토서_{stn_name}_{_chart_start}_{_chart_end}.docx",
-                    mime=("application/vnd.openxmlformats-officedocument"
-                          ".wordprocessingml.document"),
-                    key="dl_review_docx",
-                )
-                st.caption(
-                    "HWP 사용 시: 한글에서 이 .docx 파일을 열어 내용을 보완한 뒤 "
-                    "'다른 이름으로 저장 → 한글 문서(.hwp)'로 저장하세요."
-                )
-            except Exception as _docx_err:
-                st.error(f"검토서 생성 중 오류가 발생했습니다: {_docx_err}")
+            st.caption("HWP 사용 시: 한글에서 .docx를 열어 보완한 뒤 .hwp로 저장하세요.")
+        else:
+            st.warning("검토서 생성에 실패했습니다. 분석 결과와 Excel 다운로드는 유지됩니다. 다시 분석하면 검토서 생성을 재시도합니다.")

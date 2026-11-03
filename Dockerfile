@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY wind_data.py .
+COPY weather_errors.py .
+COPY browser_keys.py .
 COPY assets/ ./assets/
 COPY .streamlit/config.toml .streamlit/config.toml
 

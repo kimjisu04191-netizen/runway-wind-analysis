@@ -24,6 +24,11 @@ KMA ASOS 시간 관측 데이터를 기반으로 활주로 측풍 이용률과 �
 채우지 않는다. 환경변수 배포도 `_secret()`에서 지원한다. 인증 요청은 HTTPS만 사용하고,
 응답 본문/요청 URL/예외 원문은 사용자에게 표시하지 않는다.
 
+사용자가 브라우저 직접 저장을 선택한 경우에만 `browser_keys.py`가 사용자 입력 키를
+localStorage에 저장한다. 기본 자동 저장은 금지하며 서버 기본 키는 저장 대상에서 제외한다.
+세션 사용자 입력은 `user_api_keys`에 두어 dialog 위젯 정리와 분리한다.
+완료 분석과 생성 파일은 `analysis_result`에 보관하며 화면 갱신 시 재사용한다.
+
 ```
 ASOS_API_KEY   → st.secrets["ASOS_API_KEY"]  (data.go.kr, AsosHourlyInfoService)
 KMA_HUB_KEY    → st.secrets["KMA_HUB_KEY"]   (apihub.kma.go.kr, stn_inf.php)
