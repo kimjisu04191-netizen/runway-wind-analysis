@@ -2,9 +2,11 @@
 
 ## 프로젝트 개요
 
-KMA ASOS 시간 관측 데이터를 기반으로 활주로 측풍 이용률과 풍배도를 분석하는 **Streamlit 단일 파일 앱**.
+KMA ASOS 시간 관측 데이터를 기반으로 활주로 측풍 이용률과 풍배도를 분석하는 **Streamlit 앱**.
 
 - 메인 파일: `app.py` (전체 로직, UI, 분석 모두 포함)
+- 자료 검증: `wind_data.py` (정시·단일 지점·범위·중복·단위 검증)
+- 검증: `python -m pytest -q`, `python -m pip_audit`; 전체 검토 기록은 `docs/SECURITY_REVIEW.md`
 - 배포: Streamlit Community Cloud (`kimjisu04191-netizen/runway-wind-analysis` GitHub repo — **PUBLIC**)
 - 로컬 미리보기 포트: 8513
 
@@ -16,7 +18,11 @@ KMA ASOS 시간 관측 데이터를 기반으로 활주로 측풍 이용률과 �
 
 키 3개는 오직 두 곳에서만 관리된다:
 1. `.streamlit/secrets.toml` — 로컬 전용, `.gitignore`에 등록됨, GitHub에 절대 올라가지 않음
-2. `st.session_state` — 런타임 세션 한정 보관, `_secret()` 헬퍼로 로드
+2. `st.session_state` — 사용자가 직접 입력한 대체 키만 세션 한정 보관
+
+서버 키는 `_get_api_key()` → `_secret()`을 통해 요청할 때만 읽으며 password 위젯에 미리
+채우지 않는다. 환경변수 배포도 `_secret()`에서 지원한다. 인증 요청은 HTTPS만 사용하고,
+응답 본문/요청 URL/예외 원문은 사용자에게 표시하지 않는다.
 
 ```
 ASOS_API_KEY   → st.secrets["ASOS_API_KEY"]  (data.go.kr, AsosHourlyInfoService)

@@ -6,8 +6,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY wind_data.py .
 COPY assets/ ./assets/
 COPY .streamlit/config.toml .streamlit/config.toml
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
 
 ENV PORT=8080
 EXPOSE 8080
@@ -16,6 +20,4 @@ EXPOSE 8080
 CMD streamlit run app.py \
     --server.port=$PORT \
     --server.address=0.0.0.0 \
-    --server.headless=true \
-    --server.enableCORS=false \
-    --server.enableXsrfProtection=false
+    --server.headless=true
